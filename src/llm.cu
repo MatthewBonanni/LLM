@@ -78,11 +78,11 @@ void LLM::load_model(std::string model_path) {
     for (int i = 0; i < n_layer; i++) {
         std::cout << "> Layer " << i << std::endl;
         std::cout << "  > Allocating host and device memory..." << std::endl;
-        layers.emplace_back(n_embd, n_head);
+        layers.push_back(std::make_unique<Layer>(n_embd, n_head));
 
         std::string layer_path = base_path + "/h" + std::to_string(i);
         std::cout << "  > Loading weights..." << std::endl;
-        layers[i].load_from_hdf5(file_id, layer_path);
+        layers[i]->load_from_hdf5(file_id, layer_path);
     }
 
     // Close the file
@@ -119,6 +119,6 @@ void LLM::copy_params_host_to_device() {
     CHECK_CUDA(cudaMemcpy(d_wte, h_wte.data(), h_wte.size() * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_wpe, h_wpe.data(), h_wpe.size() * sizeof(float), cudaMemcpyHostToDevice));
     for (int i = 0; i < n_layer; i++) {
-        layers[i].copy_host_to_device();
+        layers[i]->copy_host_to_device();
     }
 }

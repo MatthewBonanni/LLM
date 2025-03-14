@@ -36,5 +36,5 @@ class LLM {
         float* d_wte;
         float* d_wpe;
 
-        std::vector<Layer> layers;
+        std::vector<std::unique_ptr<Layer>> layers;
 };
