@@ -117,6 +117,18 @@ std::vector<int> Tokenizer::tokenize(const std::string& text) {
     return token_ids;
 }
 
+std::string Tokenizer::detokenize(const std::vector<int>& tokens) {
+    std::string text;
+    for (int token_id : tokens) {
+        if (id_to_token.find(token_id) != id_to_token.end()) {
+            text += id_to_token[token_id];
+        } else {
+            std::cerr << "Warning: Unknown token ID '" << token_id << "'\n";
+        }
+    }
+    return text;
+}
+
 std::vector<std::string> Tokenizer::apply_bpe(const std::vector<std::string>& chars) {
     std::vector<std::string> tokens = chars;
     std::string token;
