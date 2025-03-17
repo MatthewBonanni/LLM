@@ -78,17 +78,17 @@ __global__ void multi_head_attention(float* input, float* output, float* w_qkv, 
     if (i_token >= seq_length) {
         return;
     }
-    
+
     // Calculate dimensions
     int d_k = n_embd / n_head; // Dimension of each head
     int qkv_size = 3 * n_embd; // Size of Q, K, V for each token
-    
+
     // Allocate shared memory dynamically
     extern __shared__ float shared_mem[];
     float* qkv       = shared_mem;                             // Size: seq_length * qkv_size
     float* out_heads = qkv        + seq_length * qkv_size;     // Size: n_head * seq_length * d_k
     float* scores    = out_heads  + n_head * seq_length * d_k; // Size: seq_length
-    
+
     // Linear projection to get Q, K, V for this token
     for (int i = 0; i < qkv_size; i++) {
         float val = b_qkv[i];
@@ -97,50 +97,58 @@ __global__ void multi_head_attention(float* input, float* output, float* w_qkv, 
         }
         qkv[i_token * qkv_size + i] = val;
     }
-    
+
     __syncthreads();
-    
+
     // Set up pointers to the Q, K, V sections in shared memory
     float* q_start = qkv;                           // Q starts at the beginning
     float* k_start = q_start + seq_length * n_embd; // K starts after all Q values
     float* v_start = k_start + seq_length * n_embd; // V starts after all K values
-    
+
     float scale = 1.0f / sqrtf(d_k);
-    
+
     // Process each attention head
     for (int i_head = 0; i_head < n_head; i_head++) {
         // Output pointer for this head and token
         float* out_ptr = out_heads + i_head * seq_length * d_k + i_token * d_k;
-        
+
         // For current token (i_token) and current head (i_head)
         float* q_ptr = q_start + i_token * n_embd + i_head * d_k;
-        
+
         // Calculate attention scores between current token and all other tokens
         float max_val = -INFINITY;
         for (int j_token = 0; j_token < seq_length; j_token++) {
-            // Get K values for token j_token, head i_head
-            float* k_ptr = k_start + j_token * n_embd + i_head * d_k;
-            
-            // Compute dot product
-            float dot = 0.0f;
-            for (int d = 0; d < d_k; d++) {
-                dot += q_ptr[d] * k_ptr[d];
+            // Causal masking: only attend to positions j_token <= i_token
+            if (j_token <= i_token) {
+                // Get K values for token j_token, head i_head
+                float* k_ptr = k_start + j_token * n_embd + i_head * d_k;
+
+                // Compute dot product
+                float dot = 0.0f;
+                for (int d = 0; d < d_k; d++) {
+                    dot += q_ptr[d] * k_ptr[d];
+                }
+                scores[j_token] = dot * scale;
+                max_val = fmaxf(max_val, scores[j_token]);
             }
-            scores[j_token] = dot * scale;
-            max_val = fmaxf(max_val, scores[j_token]);
         }
         
         // Softmax calculation for attention weights
         float sum = 0.0f;
         for (int j_token = 0; j_token < seq_length; j_token++) {
-            scores[j_token] = expf(scores[j_token] - max_val);
-            sum += scores[j_token];
+            // Causal masking: masked tokens have zero weight
+            if (j_token <= i_token) {
+                scores[j_token] = expf(scores[j_token] - max_val);
+                sum += scores[j_token];
+            } else {
+                scores[j_token] = 0.0f;
+            }
         }
-        
+
         for (int j_token = 0; j_token < seq_length; j_token++) {
             scores[j_token] /= sum;
         }
-        
+
         // Calculate weighted sum of values
         for (int d = 0; d < d_k; d++) {
             float weighted_sum = 0.0f;
@@ -152,9 +160,9 @@ __global__ void multi_head_attention(float* input, float* output, float* w_qkv, 
             out_ptr[d] = weighted_sum;
         }
     }
-    
+
     __syncthreads();
-    
+
     // Linear projection to get final output
     for (int i = 0; i < n_embd; i++) {
         float val = b_proj[i];
@@ -253,18 +261,20 @@ void Layer::apply(float* d_hidden_states, float* d_residual, float* d_temp, int 
     int shared_mem_size = seq_length * 3 * n_embd +   // qkv storage
                           n_head * seq_length * d_k + // output heads storage
                           seq_length;                 // attention scores storage
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    if (shared_mem_size * sizeof(float) > prop.sharedMemPerBlock) {
+        throw std::runtime_error("Requested shared memory exceeds device limit.");
+    }
     
     // Step 1: Save input for residual connection
-    std::cout << "> STEP 1: Saving input for residual connection" << std::endl;
     CHECK_CUDA(cudaMemcpy(d_residual, d_hidden_states, seq_length * n_embd * sizeof(float), cudaMemcpyDeviceToDevice));
     
     // Step 2: First layer normalization
-    std::cout << "> STEP 2: First layer normalization" << std::endl;
     layer_normalization<<<grid_size, block_size>>>(d_hidden_states, d_temp, d_ln_1_g_0, d_ln_1_b_0, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
     
     // Step 3: Multi-head attention
-    std::cout << "> STEP 3: Multi-head attention" << std::endl;
     multi_head_attention<<<grid_size, block_size, shared_mem_size * sizeof(float)>>>(
         d_temp, d_hidden_states, 
         d_attn_c_attn_w_0, d_attn_c_attn_b_0, 
@@ -273,21 +283,17 @@ void Layer::apply(float* d_hidden_states, float* d_residual, float* d_temp, int 
     CHECK_CUDA(cudaGetLastError());
     
     // Step 4: Add residual connection
-    std::cout << "> STEP 4: Add residual connection" << std::endl;
     add_residual<<<grid_size, block_size>>>(d_hidden_states, d_residual, d_hidden_states, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
     
     // Step 5: Save output for residual connection
-    std::cout << "> STEP 5: Saving output for residual connection" << std::endl;
     CHECK_CUDA(cudaMemcpy(d_residual, d_hidden_states, seq_length * n_embd * sizeof(float), cudaMemcpyDeviceToDevice));
     
     // Step 6: Second layer normalization
-    std::cout << "> STEP 6: Second layer normalization" << std::endl;
     layer_normalization<<<grid_size, block_size>>>(d_hidden_states, d_temp, d_ln_2_g_0, d_ln_2_b_0, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
     
     // Step 7: MLP (feedforward network)
-    std::cout << "> STEP 7: MLP (feedforward network)" << std::endl;
     mlp<<<grid_size, block_size>>>(
         d_temp, d_hidden_states,
         d_mlp_c_fc_w_0, d_mlp_c_fc_b_0,
@@ -296,12 +302,8 @@ void Layer::apply(float* d_hidden_states, float* d_residual, float* d_temp, int 
     CHECK_CUDA(cudaGetLastError());
     
     // Step 8: Add residual connection
-    std::cout << "> STEP 8: Add residual connection" << std::endl;
     add_residual<<<grid_size, block_size>>>(d_hidden_states, d_residual, d_hidden_states, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
-    
-    // Final synchronization (only if needed)
-    // CHECK_CUDA(cudaDeviceSynchronize());
 }
 
 void Layer::load_from_hdf5(hid_t file_id, const std::string& layer_path) {

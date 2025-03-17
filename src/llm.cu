@@ -140,7 +140,6 @@ void LLM::apply_embeddings(int* d_token_ids, float* d_embeddings, int token_coun
     int threads = 256;
     int blocks = (token_count * n_embd + threads - 1) / threads;
     embedding_kernel<<<blocks, threads>>>(d_token_ids, d_wte_0, d_wpe_0, d_embeddings, token_count, n_embd);
-    CHECK_CUDA(cudaDeviceSynchronize());
 }
 
 __global__ void layer_norm_kernel(float* hidden_states, const float* gamma, const float* beta,
@@ -214,7 +213,6 @@ void LLM::apply_lm_head(float* d_hidden_state, float* d_logits) {
     int threads = 256;
     int blocks = (n_vocab + threads - 1) / threads;
     lm_head_kernel<<<blocks, threads>>>(d_hidden_state, d_logits, d_wte_0, nullptr, n_vocab, n_embd);
-    CHECK_CUDA(cudaDeviceSynchronize());
 }
 
 void LLM::copy_params_host_to_device() {
@@ -270,6 +268,7 @@ std::vector<float> LLM::forward_pass(const std::vector<int>& tokens) {
     float* d_logits = nullptr;
     std::vector<float> h_logits(n_vocab);
 
+    std::cout << std::endl;
     std::cout << "Forward pass..." << std::endl;
 
     // Allocate device memory
@@ -279,11 +278,10 @@ std::vector<float> LLM::forward_pass(const std::vector<int>& tokens) {
     CHECK_CUDA(cudaMalloc(&d_residual, tokens.size() * n_embd * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_temp, tokens.size() * n_embd * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_logits, n_vocab * sizeof(float)));
-    
+
     // Token IDs
-    std::cout << "> Copying token IDs to device..." << std::endl;
     CHECK_CUDA(cudaMemcpy(d_token_ids, tokens.data(), tokens.size() * sizeof(int), cudaMemcpyHostToDevice));
-        
+
     // Embeddings
     std::cout << "> Computing embeddings..." << std::endl;
     apply_embeddings(d_token_ids, d_hidden_states, tokens.size());
@@ -294,19 +292,24 @@ std::vector<float> LLM::forward_pass(const std::vector<int>& tokens) {
         std::cout << "> Applying layer " << i << "..." << std::endl;
         layers[i]->apply(d_hidden_states, d_residual, d_temp, tokens.size());
     }
-        
-    // // Apply final layer norm
-    // apply_final_layer_norm(d_hidden_states, tokens.size());
-        
-    // // Get logits for the last token position
-    // apply_lm_head(d_hidden_states + (tokens.size() - 1) * n_embd, d_logits);
-        
-    // // Copy logits to host
-    // CHECK_CUDA(cudaMemcpy(h_logits.data(), d_logits, n_vocab * sizeof(float), cudaMemcpyDeviceToHost));
 
-    // // Clean up resources
-    // clean_up_memory({d_token_ids, d_hidden_states, d_residual, d_logits});
-    
+    // Apply final layer norm
+    std::cout << "> Applying final layer norm..." << std::endl;
+    apply_final_layer_norm(d_hidden_states, tokens.size());
+
+    // Get logits for the last token position
+    std::cout << "> Applying LM head..." << std::endl;
+    apply_lm_head(d_hidden_states + (tokens.size() - 1) * n_embd, d_logits);
+
+    // Synchronize device
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // Copy logits to host
+    CHECK_CUDA(cudaMemcpy(h_logits.data(), d_logits, n_vocab * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Clean up resources
+    clean_up_memory({d_token_ids, d_hidden_states, d_residual, d_logits});
+
     return h_logits;
 }
 
