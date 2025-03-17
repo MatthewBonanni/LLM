@@ -175,3 +175,7 @@ std::vector<std::string> Tokenizer::split_utf8_chars(const std::string& input) {
     }
     return chars;
 }
+
+int Tokenizer::eos_token_id() const {
+    return token_to_id.at("<|endoftext|>");
+}

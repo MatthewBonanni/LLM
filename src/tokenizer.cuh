@@ -14,6 +14,7 @@ class Tokenizer {
 
         std::vector<int> tokenize(const std::string& text);
         std::string detokenize(const std::vector<int>& tokens);
+        int eos_token_id() const;
 
     private:
         void load_pattern_string(const std::string& model_path);

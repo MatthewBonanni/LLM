@@ -11,11 +11,16 @@ class Layer {
     public:
         Layer(int n_embd, int n_head);
         ~Layer();
+        void apply(float* d_hidden_states, float* d_residual, int seq_length);
         void load_from_hdf5(hid_t file_id, const std::string& layer_path);
         void copy_host_to_device();
         void copy_device_to_host();
 
     private:
+        // Layer parameters
+        int n_embd;
+        int n_head;
+
         // Attention
         std::vector<float> h_attn_c_attn_w_0;
         std::vector<float> h_attn_c_attn_b_0;
