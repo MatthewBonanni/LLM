@@ -21,7 +21,10 @@ LLM::LLM(const std::string& model_path) :
         d_wte_0(nullptr),
         d_wpe_0(nullptr),
         d_ln_f_b_0(nullptr),
-        d_ln_f_g_0(nullptr) {
+        d_ln_f_g_0(nullptr),
+        max_out_length(50),
+        temperature(0.8f),
+        n_top_predictions(10) {
     load_hparams(model_path);
     load_model(model_path);
 }
@@ -113,20 +116,20 @@ __global__ void embedding_kernel(const int* token_ids,
                                  int embedding_dim) {
     // Calculate global thread ID
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
+
     // Check if this thread should process an element
     if (idx < token_count * embedding_dim) {
         // Calculate which token and which embedding dimension this thread is handling
         int token_idx = idx / embedding_dim;    // Which token
         int embd_idx = idx % embedding_dim;     // Which dimension in the embedding
-        
+
         // Get the token ID for this position
         int token_id = token_ids[token_idx];
-        
+
         // Calculate offset in embedding tables
         int token_offset = token_id * embedding_dim + embd_idx;
         int pos_offset = token_idx * embedding_dim + embd_idx;
-        
+
         // Sum token embedding and positional embedding
         embeddings[idx] = wte[token_offset] + wpe[pos_offset];
     }
@@ -141,19 +144,19 @@ void LLM::apply_embeddings(int* d_token_ids, float* d_embeddings, int token_coun
 }
 
 __global__ void layer_norm_kernel(float* hidden_states, const float* gamma, const float* beta,
-                                  int seq_length, int hidden_size, float epsilon) {
+                                  int seq_length, int hidden_size) {
     extern __shared__ float shared_data[];
     float* shared_sum = shared_data;
     float* shared_sum_sq = shared_data + blockDim.x;
-    
+
     int pos = blockIdx.x;
     int tid = threadIdx.x;
     float* pos_hidden = hidden_states + pos * hidden_size;
-    
+
     // Initialize shared memory
     shared_sum[tid] = 0.0f;
     shared_sum_sq[tid] = 0.0f;
-    
+
     // Calculate partial sums for mean and variance
     for (int i = tid; i < hidden_size; i += blockDim.x) {
         float val = pos_hidden[i];
@@ -161,7 +164,7 @@ __global__ void layer_norm_kernel(float* hidden_states, const float* gamma, cons
         shared_sum_sq[tid] += val * val;
     }
     __syncthreads();
-    
+
     // Parallel reduction for sum and sum of squares
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
@@ -170,12 +173,13 @@ __global__ void layer_norm_kernel(float* hidden_states, const float* gamma, cons
         }
         __syncthreads();
     }
-    
+
     // Calculate mean and variance
+    const float epsilon = 1e-5f;
     float mean = shared_sum[0] / hidden_size;
     float var = (shared_sum_sq[0] / hidden_size) - (mean * mean) + epsilon;
     float inv_std = rsqrtf(var);
-    
+
     // Apply normalization with gamma and beta
     for (int i = tid; i < hidden_size; i += blockDim.x) {
         float normalized = (pos_hidden[i] - mean) * inv_std;
@@ -184,16 +188,33 @@ __global__ void layer_norm_kernel(float* hidden_states, const float* gamma, cons
 }
 
 void LLM::apply_final_layer_norm(float* d_hidden_states, int seq_length) {
-    // Layer norm parameters
-    const float epsilon = 1e-5f;
-    
     // Launch one block per sequence position, with threads for hidden dimension
     dim3 grid(seq_length);
     dim3 block(256);
     size_t shared_mem_size = 2 * block.x * sizeof(float);
-    
+
     layer_norm_kernel<<<grid, block, shared_mem_size>>>(
-        d_hidden_states, d_ln_f_g_0, d_ln_f_b_0, seq_length, n_embd, epsilon);
+        d_hidden_states, d_ln_f_g_0, d_ln_f_b_0, seq_length, n_embd);
+}
+
+__global__ void lm_head_kernel(float* hidden_state, float* logits,
+                               float* weights, float* biases,
+                               int n_vocab, int n_embd) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n_vocab) {
+        logits[idx] = biases ? biases[idx] : 0.0f;
+        for (int i = 0; i < n_embd; i++) {
+            logits[idx] += hidden_state[i] * weights[idx * n_embd + i];
+        }
+    }
+}
+
+void LLM::apply_lm_head(float* d_hidden_state, float* d_logits) {
+    // GPT-2 uses wte as the lm_head
+    int threads = 256;
+    int blocks = (n_vocab + threads - 1) / threads;
+    lm_head_kernel<<<blocks, threads>>>(d_hidden_state, d_logits, d_wte_0, nullptr, n_vocab, n_embd);
+    CHECK_CUDA(cudaDeviceSynchronize());
 }
 
 void LLM::copy_params_host_to_device() {
@@ -206,84 +227,90 @@ void LLM::copy_params_host_to_device() {
 
 void LLM::run_interactive() {
     std::cout << "LLM Running Mode. Use CTRL-C to quit.\n";
-    
+
     while (true) {
         // Get user input
         std::string input;
         std::cout << ">> ";
         std::getline(std::cin, input);
-        
+
         // Tokenize input
         std::vector<int> h_token_ids = tokenizer.tokenize(input);
-        
+
         // Print token info
         std::cout << "Token IDs: ";
         for (int id : h_token_ids) {
             std::cout << id << " ";
         }
         std::cout << "\nToken count: " << h_token_ids.size() << std::endl;
-        
+
         // If empty input, continue
         if (h_token_ids.empty()) {
             std::cout << "Empty input, please try again.\n";
             continue;
         }
-        
+
+        // If input is too long, truncate
+        if (h_token_ids.size() > n_ctx) {
+            h_token_ids.resize(n_ctx);
+            std::cout << "Input too long, truncating to " << n_ctx << " tokens." << std::endl;
+        }
+
         // Generate text
-        generate_text(h_token_ids, 50, 0.8f);
+        generate_text(h_token_ids);
     }
 }
 
 std::vector<float> LLM::forward_pass(const std::vector<int>& tokens) {
     // Allocate device memory for token IDs and embeddings
     int* d_token_ids = nullptr;
-    float* d_embeddings = nullptr;
     float* d_hidden_states = nullptr;
     float* d_residual = nullptr;
+    float* d_temp = nullptr;
     float* d_logits = nullptr;
     std::vector<float> h_logits(n_vocab);
+
+    std::cout << "Forward pass..." << std::endl;
+
+    // Allocate device memory
+    std::cout << "> Allocating device memory..." << std::endl;
+    CHECK_CUDA(cudaMalloc(&d_token_ids, tokens.size() * sizeof(int)));
+    CHECK_CUDA(cudaMalloc(&d_hidden_states, tokens.size() * n_embd * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_residual, tokens.size() * n_embd * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_temp, tokens.size() * n_embd * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_logits, n_vocab * sizeof(float)));
     
     // Token IDs
-    CHECK_CUDA(cudaMalloc(&d_token_ids, tokens.size() * sizeof(int)));
+    std::cout << "> Copying token IDs to device..." << std::endl;
     CHECK_CUDA(cudaMemcpy(d_token_ids, tokens.data(), tokens.size() * sizeof(int), cudaMemcpyHostToDevice));
         
     // Embeddings
-    CHECK_CUDA(cudaMalloc(&d_embeddings, tokens.size() * n_embd * sizeof(float)));
-    apply_embeddings(d_token_ids, d_embeddings, tokens.size());
-    CHECK_CUDA(cudaFree(d_token_ids)); // Free token IDs after embedding
+    std::cout << "> Computing embeddings..." << std::endl;
+    apply_embeddings(d_token_ids, d_hidden_states, tokens.size());
     d_token_ids = nullptr;
-        
-    // Hidden states and residual
-    CHECK_CUDA(cudaMalloc(&d_hidden_states, tokens.size() * n_embd * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_residual, tokens.size() * n_embd * sizeof(float)));
-        
-    // Copy embeddings to hidden states
-    CHECK_CUDA(cudaMemcpy(d_hidden_states, d_embeddings, tokens.size() * n_embd * sizeof(float), cudaMemcpyDeviceToDevice));
-    CHECK_CUDA(cudaFree(d_embeddings)); // Free embeddings after copying
-    d_embeddings = nullptr;
-        
+
     // Process through transformer layers
     for (int i = 0; i < n_layer; i++) {
-        layers[i]->apply(d_hidden_states, d_residual, tokens.size());
+        std::cout << "> Applying layer " << i << "..." << std::endl;
+        layers[i]->apply(d_hidden_states, d_residual, d_temp, tokens.size());
     }
         
-    // Apply final layer norm
-    apply_final_layer_norm(d_hidden_states, tokens.size());
+    // // Apply final layer norm
+    // apply_final_layer_norm(d_hidden_states, tokens.size());
         
-    // Get logits for the last token position
-    CHECK_CUDA(cudaMalloc(&d_logits, n_vocab * sizeof(float)));
-    apply_lm_head(d_hidden_states + (tokens.size() - 1) * n_embd, d_logits);
+    // // Get logits for the last token position
+    // apply_lm_head(d_hidden_states + (tokens.size() - 1) * n_embd, d_logits);
         
-    // Copy logits to host
-    CHECK_CUDA(cudaMemcpy(h_logits.data(), d_logits, n_vocab * sizeof(float), cudaMemcpyDeviceToHost));
+    // // Copy logits to host
+    // CHECK_CUDA(cudaMemcpy(h_logits.data(), d_logits, n_vocab * sizeof(float), cudaMemcpyDeviceToHost));
 
-    // Clean up resources
-    clean_up_memory({d_token_ids, d_embeddings, d_hidden_states, d_residual, d_logits});
+    // // Clean up resources
+    // clean_up_memory({d_token_ids, d_hidden_states, d_residual, d_logits});
     
     return h_logits;
 }
 
-std::vector<std::pair<float, int>> LLM::get_top_predictions(const std::vector<float>& logits, int k) {
+std::vector<std::pair<float, int>> LLM::get_top_predictions(const std::vector<float>& logits) {
     std::vector<std::pair<float, int>> probs;
     probs.reserve(n_vocab);
     
@@ -304,13 +331,13 @@ std::vector<std::pair<float, int>> LLM::get_top_predictions(const std::vector<fl
     }
     
     // Sort by probability (descending)
-    std::partial_sort(probs.begin(), probs.begin() + k, probs.end(),
+    std::partial_sort(probs.begin(), probs.begin() + n_top_predictions, probs.end(),
                       [](const auto& a, const auto& b) { return a.first > b.first; });
     
     return probs;
 }
 
-int LLM::sample_token(const std::vector<std::pair<float, int>>& probs, float temperature) {
+int LLM::sample_token(const std::vector<std::pair<float, int>>& probs) {
     // If temperature is 0, do greedy sampling
     if (temperature == 0.0f) {
         return probs[0].second;
@@ -333,6 +360,7 @@ int LLM::sample_token(const std::vector<std::pair<float, int>>& probs, float tem
     }
     
     // Sample based on adjusted probabilities
+    // TODO - better random number generation
     float r = static_cast<float>(rand()) / RAND_MAX;
     float cdf = 0.0f;
     
@@ -347,19 +375,19 @@ int LLM::sample_token(const std::vector<std::pair<float, int>>& probs, float tem
     return temp_adjusted[0].second;
 }
 
-void LLM::generate_text(const std::vector<int>& input_ids, int max_tokens, float temperature) {
+void LLM::generate_text(const std::vector<int>& input_ids) {
     std::cout << "Generated: ";
     std::vector<int> generated_tokens = input_ids;
     
-    for (int gen_idx = 0; gen_idx < max_tokens; gen_idx++) {
+    for (int gen_idx = 0; gen_idx < max_out_length; gen_idx++) {
         // Forward pass for the current sequence
         std::vector<float> logits = forward_pass(generated_tokens);
         
         // Get predictions
-        auto predictions = get_top_predictions(logits, 40);
+        auto predictions = get_top_predictions(logits);
         
         // Sample next token
-        int next_token = sample_token(predictions, temperature);
+        int next_token = sample_token(predictions);
         
         // Add to generated sequence
         generated_tokens.push_back(next_token);
