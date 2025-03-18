@@ -15,6 +15,7 @@
 #include "io.cuh"
 #include "tokenizer.cuh"
 #include "layer.cuh"
+#include "kernels.cuh"
 
 LLM::LLM(const std::string& model_path) :
         tokenizer(model_path),
@@ -108,33 +109,6 @@ void LLM::load_model(std::string model_path) {
     copy_params_host_to_device();
 }
 
-__global__ void embedding_kernel(const int* token_ids,
-                                 const float* wte,
-                                 const float* wpe,
-                                 float* embeddings,
-                                 int token_count,
-                                 int embedding_dim) {
-    // Calculate global thread ID
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    // Check if this thread should process an element
-    if (idx < token_count * embedding_dim) {
-        // Calculate which token and which embedding dimension this thread is handling
-        int token_idx = idx / embedding_dim;    // Which token
-        int embd_idx = idx % embedding_dim;     // Which dimension in the embedding
-
-        // Get the token ID for this position
-        int token_id = token_ids[token_idx];
-
-        // Calculate offset in embedding tables
-        int token_offset = token_id * embedding_dim + embd_idx;
-        int pos_offset = token_idx * embedding_dim + embd_idx;
-
-        // Sum token embedding and positional embedding
-        embeddings[idx] = wte[token_offset] + wpe[pos_offset];
-    }
-}
-
 void LLM::apply_embeddings(int* d_token_ids, float* d_embeddings, int token_count) {
     // Kernel to compute final embeddings
     int threads = 256;
@@ -142,77 +116,20 @@ void LLM::apply_embeddings(int* d_token_ids, float* d_embeddings, int token_coun
     embedding_kernel<<<blocks, threads>>>(d_token_ids, d_wte_0, d_wpe_0, d_embeddings, token_count, n_embd);
 }
 
-__global__ void layer_norm_kernel(float* hidden_states, const float* gamma, const float* beta,
-                                  int seq_length, int hidden_size) {
-    extern __shared__ float shared_data[];
-    float* shared_sum = shared_data;
-    float* shared_sum_sq = shared_data + blockDim.x;
-
-    int pos = blockIdx.x;
-    int tid = threadIdx.x;
-    float* pos_hidden = hidden_states + pos * hidden_size;
-
-    // Initialize shared memory
-    shared_sum[tid] = 0.0f;
-    shared_sum_sq[tid] = 0.0f;
-
-    // Calculate partial sums for mean and variance
-    for (int i = tid; i < hidden_size; i += blockDim.x) {
-        float val = pos_hidden[i];
-        shared_sum[tid] += val;
-        shared_sum_sq[tid] += val * val;
-    }
-    __syncthreads();
-
-    // Parallel reduction for sum and sum of squares
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-            shared_sum_sq[tid] += shared_sum_sq[tid + stride];
-        }
-        __syncthreads();
-    }
-
-    // Calculate mean and variance
-    const float epsilon = 1e-5f;
-    float mean = shared_sum[0] / hidden_size;
-    float var = (shared_sum_sq[0] / hidden_size) - (mean * mean) + epsilon;
-    float inv_std = rsqrtf(var);
-
-    // Apply normalization with gamma and beta
-    for (int i = tid; i < hidden_size; i += blockDim.x) {
-        float normalized = (pos_hidden[i] - mean) * inv_std;
-        pos_hidden[i] = gamma[i] * normalized + beta[i];
-    }
-}
-
 void LLM::apply_final_layer_norm(float* d_hidden_states, int seq_length) {
     // Launch one block per sequence position, with threads for hidden dimension
-    dim3 grid(seq_length);
-    dim3 block(256);
-    size_t shared_mem_size = 2 * block.x * sizeof(float);
-
-    layer_norm_kernel<<<grid, block, shared_mem_size>>>(
+    int threads = 256;
+    int blocks = (n_embd + threads - 1) / threads;
+    layer_normalization_kernel<<<blocks, threads>>>(
         d_hidden_states, d_ln_f_g_0, d_ln_f_b_0, seq_length, n_embd);
-}
-
-__global__ void lm_head_kernel(float* hidden_state, float* logits,
-                               float* weights, float* biases,
-                               int n_vocab, int n_embd) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n_vocab) {
-        logits[idx] = biases ? biases[idx] : 0.0f;
-        for (int i = 0; i < n_embd; i++) {
-            logits[idx] += hidden_state[i] * weights[idx * n_embd + i];
-        }
-    }
 }
 
 void LLM::apply_lm_head(float* d_hidden_state, float* d_logits) {
     // GPT-2 uses wte as the lm_head
     int threads = 256;
     int blocks = (n_vocab + threads - 1) / threads;
-    lm_head_kernel<<<blocks, threads>>>(d_hidden_state, d_logits, d_wte_0, nullptr, n_vocab, n_embd);
+    lm_head_kernel<<<blocks, threads>>>(
+        d_hidden_state, d_logits, d_wte_0, nullptr, n_vocab, n_embd);
 }
 
 void LLM::copy_params_host_to_device() {
@@ -296,6 +213,19 @@ std::vector<float> LLM::forward_pass(const std::vector<int>& tokens) {
     // Apply final layer norm
     std::cout << "> Applying final layer norm..." << std::endl;
     apply_final_layer_norm(d_hidden_states, tokens.size());
+
+    // DEBUG
+    int n_print = 5;
+    std::vector<float> h_hidden_states(tokens.size() * n_embd);
+    CHECK_CUDA(cudaMemcpy(h_hidden_states.data(), d_hidden_states, tokens.size() * n_embd * sizeof(float), cudaMemcpyDeviceToHost));
+    std::cout << "Temp:" << std::endl;
+    for (int i = 0; i < tokens.size(); i++) {
+        for (int j = 0; j < n_print; j++) {
+            std::cout << h_hidden_states[i * n_embd + j] << " ";
+        }
+        std::cout << std::endl;
+    }
+    exit(0);
 
     // Get logits for the last token position
     std::cout << "> Applying LM head..." << std::endl;

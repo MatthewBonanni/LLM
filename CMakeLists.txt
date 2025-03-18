@@ -32,6 +32,7 @@ FetchContent_MakeAvailable(hdf5)
 # Add executable
 add_executable(llm 
     src/main.cu
+    src/kernels.cu
     src/llm.cu
     src/tokenizer.cu
     src/layer.cu
