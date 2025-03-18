@@ -74,11 +74,26 @@ __device__ __host__ float gelu(float x) {
     return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
 }
 
-__global__ void multi_head_attention(float* input, float* output,
-                                     float* w_qkv, float* b_qkv, 
-                                     float* w_proj, float* b_proj,
-                                     int seq_length, int n_embd, int n_head,
-                                     float* qkv) {
+__global__ void qkv_projection_kernel(float* input, float* output,
+                                      float* w_qkv, float* b_qkv,
+                                      int seq_length, int n_embd, int qkv_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int i_token = idx; // Each thread processes one token
+    if (i_token >= seq_length) {
+        return;
+    }
+
+    for (int i = 0; i < qkv_size; i++) {
+        float val = b_qkv[i];
+        for (int j = 0; j < n_embd; j++) {
+            val += input[i_token * n_embd + j] * w_qkv[j * qkv_size + i];
+        }
+        output[i_token * qkv_size + i] = val;
+    }
+}
+
+__global__ void multi_head_attention_kernel(float* qkv, float* output,
+                                            int seq_length, int n_embd, int n_head) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int i_token = idx; // Each thread processes one token
     if (i_token >= seq_length) {
@@ -91,19 +106,6 @@ __global__ void multi_head_attention(float* input, float* output,
 
     // Scores register
     float scores[SEQ_LENGTH_MAX];
-
-    // Linear projection to get Q, K, V for this token
-    for (int i = 0; i < qkv_size; i++) {
-        float val = b_qkv[i];
-        for (int j = 0; j < n_embd; j++) {
-            val += input[i_token * n_embd + j] * w_qkv[j * qkv_size + i];
-        }
-        qkv[i_token * qkv_size + i] = val;
-    }
-
-    // Ensure all threads have completed their QKV calculations
-    // Prevent race condition in the following loop
-    __syncthreads();
 
     float scale = 1.0f / sqrtf(d_k);
 
@@ -152,25 +154,32 @@ __global__ void multi_head_attention(float* input, float* output,
                                 qkv[j_token * qkv_size + 2 * n_embd + i_head * d_k + d];
             }
             // Use input as a temporary buffer to store head outputs
-            input[i_head * seq_length * d_k + i_token * d_k + d] = weighted_sum;
+            output[i_token * n_embd + i_head * d_k + d] = weighted_sum;
         }
     }
+}
 
-    // Linear projection to get final output
+__global__ void final_projection_kernel(float* input, float* output,
+                                        float* w_proj, float* b_proj,
+                                        int seq_length, int n_embd) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int i_token = idx; // Each thread processes one token
+    if (i_token >= seq_length) {
+        return;
+    }
+
     for (int i = 0; i < n_embd; i++) {
         float val = b_proj[i];
-        for (int i_head = 0; i_head < n_head; i_head++) {
-            for (int d = 0; d < d_k; d++) {
-                int j = i_head * d_k + d;  // Concatenated head outputs
-                val += input[i_head * seq_length * d_k + i_token * d_k + d] *
-                       w_proj[i * n_embd + j];
-            }
+        for (int j = 0; j < n_embd; j++) {
+            val += input[i_token * n_embd + j] * w_proj[j * n_embd + i];
         }
         output[i_token * n_embd + i] = val;
     }
 }
 
-__global__ void layer_normalization(float* input, float* output, float* gamma, float* beta, int seq_length, int n_embd) {
+__global__ void layer_normalization_kernel(float* input, float* output,
+                                           float* gamma, float* beta,
+                                           int seq_length, int n_embd) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int i_token = idx; // Each thread processes one token
     if (i_token >= seq_length) {
@@ -202,8 +211,8 @@ __global__ void layer_normalization(float* input, float* output, float* gamma, f
     }
 }
 
-__global__ void mlp(float* input, float* output, float* w_fc, float* b_fc, 
-                    float* w_proj, float* b_proj, int seq_length, int n_embd) {
+__global__ void mlp_kernel(float* input, float* output, float* w_fc, float* b_fc, 
+                           float* w_proj, float* b_proj, int seq_length, int n_embd) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int i_token = idx; // Each thread processes one token
     if (i_token >= seq_length) {
@@ -232,7 +241,7 @@ __global__ void mlp(float* input, float* output, float* w_fc, float* b_fc,
     }
 }
 
-__global__ void add_residual(float* input, float* residual, float* output, int seq_length, int n_embd) {
+__global__ void add_residual_kernel(float* input, float* residual, float* output, int seq_length, int n_embd) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int i_token = idx; // Each thread processes one token
     if (i_token >= seq_length) {
@@ -257,88 +266,66 @@ void Layer::apply(float* d_hidden_states, float* d_residual, float* d_temp, int 
     CHECK_CUDA(cudaMemcpy(d_residual, d_hidden_states, seq_length * n_embd * sizeof(float), cudaMemcpyDeviceToDevice));
     
     // Step 2: First layer normalization
-    layer_normalization<<<grid_size, block_size>>>(d_hidden_states, d_temp, d_ln_1_g_0, d_ln_1_b_0, seq_length, n_embd);
+    layer_normalization_kernel<<<grid_size, block_size>>>(
+        d_hidden_states, d_temp, d_ln_1_g_0, d_ln_1_b_0, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
 
     // Step 3: Multi-head attention
-    multi_head_attention<<<grid_size, block_size>>>(
-        d_temp, d_hidden_states, 
+    // Step 3.1: QKV projection
+    qkv_projection_kernel<<<grid_size, block_size>>>(
+        d_temp, d_qkv, 
         d_attn_c_attn_w_0, d_attn_c_attn_b_0, 
-        d_attn_c_proj_w_0, d_attn_c_proj_b_0, 
-        seq_length, n_embd, n_head,
-        d_qkv);
+        seq_length, n_embd, 3 * n_embd);
     CHECK_CUDA(cudaGetLastError());
+
+    // Step 3.2: Multi-head attention
+    multi_head_attention_kernel<<<grid_size, block_size>>>(
+        d_qkv, d_hidden_states, 
+        seq_length, n_embd, n_head);
+    CHECK_CUDA(cudaGetLastError());
+
+    // Step 3.3: Final projection
+    final_projection_kernel<<<grid_size, block_size>>>(
+        d_hidden_states, d_temp,
+        d_attn_c_proj_w_0, d_attn_c_proj_b_0,
+        seq_length, n_embd);
     
-    // DEBUG
-    int n_print = 5;
-    // Transfer QKV to host and print
-    std::vector<float> h_qkv(seq_length * 3 * n_embd);
-    CHECK_CUDA(cudaMemcpy(h_qkv.data(), d_qkv, seq_length * 3 * n_embd * sizeof(float), cudaMemcpyDeviceToHost));
-    std::cout << "Q:" << std::endl;
-    for (int i = 0; i < seq_length; i++) {
-        for (int j = 0; j < n_print; j++) {
-            std::cout << h_qkv[i * 3 * n_embd + j] << " ";
-        }
-        std::cout << std::endl;
-    }
-    std::cout << "K:" << std::endl;
-    for (int i = 0; i < seq_length; i++) {
-        for (int j = 0; j < n_print; j++) {
-            std::cout << h_qkv[i * 3 * n_embd + n_embd + j] << " ";
-        }
-        std::cout << std::endl;
-    }
-    std::cout << "V:" << std::endl;
-    for (int i = 0; i < seq_length; i++) {
-        for (int j = 0; j < n_print; j++) {
-            std::cout << h_qkv[i * 3 * n_embd + 2 * n_embd + j] << " ";
-        }
-        std::cout << std::endl;
-    }
-
-    std::vector<float> h_hidden_states(seq_length * n_embd);
-
-    // Transfer temp to host and print them
-    CHECK_CUDA(cudaMemcpy(h_hidden_states.data(), d_temp, seq_length * n_embd * sizeof(float), cudaMemcpyDeviceToHost));
-    std::cout << "Temp:" << std::endl;
-    for (int i = 0; i < seq_length; i++) {
-        for (int j = 0; j < n_print; j++) {
-            std::cout << h_hidden_states[i * n_embd + j] << " ";
-        }
-        std::cout << std::endl;
-    }
-
-    // Transfer hidden states to host and print them
-    CHECK_CUDA(cudaMemcpy(h_hidden_states.data(), d_hidden_states, seq_length * n_embd * sizeof(float), cudaMemcpyDeviceToHost));
-    std::cout << "Hidden States:" << std::endl;
-    for (int i = 0; i < seq_length; i++) {
-        for (int j = 0; j < n_print; j++) {
-            std::cout << h_hidden_states[i * n_embd + j] << " ";
-        }
-        std::cout << std::endl;
-    }
-    exit(0);
+    // // DEBUG
+    // // Transfer temp to host and print them
+    // CHECK_CUDA(cudaMemcpy(h_hidden_states.data(), d_temp, seq_length * n_embd * sizeof(float), cudaMemcpyDeviceToHost));
+    // std::cout << "Temp:" << std::endl;
+    // for (int i = 0; i < seq_length; i++) {
+    //     for (int j = 0; j < n_print; j++) {
+    //         std::cout << h_hidden_states[i * n_embd + j] << " ";
+    //     }
+    //     std::cout << std::endl;
+    // }
+    // exit(0);
     
     // Step 4: Add residual connection
-    add_residual<<<grid_size, block_size>>>(d_hidden_states, d_residual, d_hidden_states, seq_length, n_embd);
+    add_residual_kernel<<<grid_size, block_size>>>(
+        d_temp, d_residual, d_hidden_states, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
     
     // Step 5: Save output for residual connection
     CHECK_CUDA(cudaMemcpy(d_residual, d_hidden_states, seq_length * n_embd * sizeof(float), cudaMemcpyDeviceToDevice));
     
     // Step 6: Second layer normalization
-    layer_normalization<<<grid_size, block_size>>>(d_hidden_states, d_temp, d_ln_2_g_0, d_ln_2_b_0, seq_length, n_embd);
+    layer_normalization_kernel<<<grid_size, block_size>>>(
+        d_hidden_states, d_temp, d_ln_2_g_0, d_ln_2_b_0, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
     
     // Step 7: MLP (feedforward network)
-    mlp<<<grid_size, block_size>>>(d_temp, d_hidden_states,
-                                   d_mlp_c_fc_w_0, d_mlp_c_fc_b_0,
-                                   d_mlp_c_proj_w_0, d_mlp_c_proj_b_0,
-                                   seq_length, n_embd);
+    mlp_kernel<<<grid_size, block_size>>>(
+        d_temp, d_hidden_states,
+        d_mlp_c_fc_w_0, d_mlp_c_fc_b_0,
+        d_mlp_c_proj_w_0, d_mlp_c_proj_b_0,
+        seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
     
     // Step 8: Add residual connection
-    add_residual<<<grid_size, block_size>>>(d_hidden_states, d_residual, d_hidden_states, seq_length, n_embd);
+    add_residual_kernel<<<grid_size, block_size>>>(
+        d_hidden_states, d_residual, d_hidden_states, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
 
     // Free temporary buffers
