@@ -3,6 +3,7 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <regex>
 
 #include <nlohmann/json.hpp>
 
@@ -164,15 +165,11 @@ std::vector<std::string> Tokenizer::apply_bpe(const std::vector<std::string>& ch
 }
 
 std::string Tokenizer::replace_spaces_with_G(const std::string& input) {
-    std::string result;
-    for (char c : input) {
-        if (c == ' ') {
-            result += "Ġ";
-        } else {
-            result += c;
-        }
-    }
-    return result;
+    return std::regex_replace(input, std::regex(" "), "Ġ");
+}
+
+std::string Tokenizer::replace_G_with_spaces(const std::string& input) {
+    return std::regex_replace(input, std::regex("Ġ"), " ");
 }
 
 std::vector<std::string> Tokenizer::split_utf8_chars(const std::string& input) {

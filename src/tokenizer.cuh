@@ -15,13 +15,14 @@ class Tokenizer {
         std::vector<int> tokenize(const std::string& text);
         std::string detokenize(const std::vector<int>& tokens);
         int eos_token_id() const;
+        std::string replace_spaces_with_G(const std::string& input);
+        std::string replace_G_with_spaces(const std::string& input);
 
     private:
         void load_pattern_string(const std::string& model_path);
         void load_vocab(const std::string& model_path);
         void load_bpe_merges(const std::string& model_path);
         std::vector<std::string> apply_bpe(const std::vector<std::string>& chars);
-        std::string replace_spaces_with_G(const std::string& input);
         std::vector<std::string> split_utf8_chars(const std::string& input);
 
         std::string pattern_string;

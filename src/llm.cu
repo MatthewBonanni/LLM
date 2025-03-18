@@ -291,8 +291,8 @@ void LLM::generate_text(const std::vector<int>& input_ids) {
         
         // Print the token
         std::string token_str = tokenizer.detokenize({next_token});
-        std::cout << token_str;
-        std::cout.flush();
+        std::cout << tokenizer.replace_G_with_spaces(token_str);
+        std::flush(std::cout);
         
         // Check for EOS token
         if (next_token == tokenizer.eos_token_id()) {
