@@ -82,10 +82,8 @@ std::vector<int> Tokenizer::tokenize(const std::string& text) {
     std::vector<std::string> tokens;
     std::vector<int> token_ids;
 
-    // Add leading space to text
-    std::string processed_text = " " + text;
-    auto words_begin = std::sregex_iterator(processed_text.begin(),
-                                            processed_text.end(),
+    auto words_begin = std::sregex_iterator(text.begin(),
+                                            text.end(),
                                             pattern);
     auto words_end = std::sregex_iterator();
 
