@@ -138,6 +138,8 @@ void LLM::copy_params_host_to_device() {
     for (int i = 0; i < n_layer; i++) {
         layers[i]->copy_host_to_device();
     }
+    CHECK_CUDA(cudaMemcpy(d_ln_f_b_0, h_ln_f_b_0.data(), h_ln_f_b_0.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_ln_f_g_0, h_ln_f_g_0.data(), h_ln_f_g_0.size() * sizeof(float), cudaMemcpyHostToDevice));
 }
 
 void LLM::run_interactive() {
@@ -202,7 +204,6 @@ std::vector<float> LLM::forward_pass(const std::vector<int>& tokens) {
     // Embeddings
     std::cout << "> Computing embeddings..." << std::endl;
     apply_embeddings(d_token_ids, d_hidden_states, tokens.size());
-    d_token_ids = nullptr;
 
     // Process through transformer layers
     for (int i = 0; i < n_layer; i++) {
@@ -213,19 +214,6 @@ std::vector<float> LLM::forward_pass(const std::vector<int>& tokens) {
     // Apply final layer norm
     std::cout << "> Applying final layer norm..." << std::endl;
     apply_final_layer_norm(d_hidden_states, tokens.size());
-
-    // DEBUG
-    int n_print = 5;
-    std::vector<float> h_hidden_states(tokens.size() * n_embd);
-    CHECK_CUDA(cudaMemcpy(h_hidden_states.data(), d_hidden_states, tokens.size() * n_embd * sizeof(float), cudaMemcpyDeviceToHost));
-    std::cout << "Temp:" << std::endl;
-    for (int i = 0; i < tokens.size(); i++) {
-        for (int j = 0; j < n_print; j++) {
-            std::cout << h_hidden_states[i * n_embd + j] << " ";
-        }
-        std::cout << std::endl;
-    }
-    exit(0);
 
     // Get logits for the last token position
     std::cout << "> Applying LM head..." << std::endl;
