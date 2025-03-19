@@ -179,6 +179,33 @@ void LLM::run_interactive() {
     }
 }
 
+void LLM::run_inference(const std::string& input_text) {
+    // Tokenize input
+    std::vector<int> h_token_ids = tokenizer.tokenize(input_text);
+
+    // Print token info
+    std::cout << "Token IDs: ";
+    for (int id : h_token_ids) {
+        std::cout << id << " ";
+    }
+    std::cout << "\nToken count: " << h_token_ids.size() << std::endl;
+
+    // If empty input, return
+    if (h_token_ids.empty()) {
+        std::cout << "Empty input, nothing to generate.\n";
+        return;
+    }
+
+    // If input is too long, truncate
+    if (h_token_ids.size() > n_ctx) {
+        h_token_ids.resize(n_ctx);
+        std::cout << "Input too long, truncating to " << n_ctx << " tokens." << std::endl;
+    }
+
+    // Generate text
+    generate_text(h_token_ids);
+}
+
 std::vector<float> LLM::forward_pass(const std::vector<int>& tokens) {
     // Allocate device memory for token IDs and embeddings
     int* d_token_ids = nullptr;
@@ -274,6 +301,7 @@ int LLM::sample_token(const std::vector<std::pair<float, int>>& probs) {
 
 void LLM::generate_text(const std::vector<int>& input_ids) {
     std::cout << "Generated: ";
+    std::flush(std::cout);
     std::vector<int> generated_tokens = input_ids;
     
     for (int gen_idx = 0; gen_idx < max_out_length; gen_idx++) {

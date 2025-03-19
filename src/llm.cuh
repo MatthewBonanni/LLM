@@ -19,6 +19,7 @@ class LLM {
         void load_hparams(std::string model_path);
         void load_model(std::string model_path);
         void run_interactive();
+        void run_inference(const std::string& input_text);
 
     private:
         void copy_params_host_to_device();
