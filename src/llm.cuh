@@ -19,9 +19,26 @@ class LLM {
         void load_hparams(std::string model_path);
         void load_model(std::string model_path);
         void run_interactive();
-        void run_inference(const std::vector<std::string>& input_texts);
+        void tokenize_write_and_run_inference(const std::vector<std::string>& input_texts);
+        void load_tokens_and_run_inference(const std::string& h5_file_path);
+        void run_inference(const std::vector<int>& token_ids,
+                           int batch_size,
+                           int seq_length);
+
 
     private:
+        void tokenize(const std::vector<std::string>& input_texts,
+                      std::vector<int>& token_ids,
+                      int& batch_size,
+                      int& seq_length);
+        void write_token_ids(const std::string& h5_file_path,
+                             const std::vector<int>& token_ids,
+                             int batch_size,
+                             int seq_length);
+        void load_token_ids(const std::string& h5_file_path,
+                            std::vector<int>& token_ids,
+                            int& batch_size,
+                            int& seq_length);
         void copy_params_host_to_device();
         void apply_embeddings(int* d_token_ids,
                               float* d_embeddings,

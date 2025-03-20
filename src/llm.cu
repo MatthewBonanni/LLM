@@ -10,6 +10,7 @@
 #include <random>
 
 #include <nlohmann/json.hpp>
+#include <hdf5.h>
 #include <hdf5_hl.h>
 
 #include "utils.cuh"
@@ -198,41 +199,155 @@ void LLM::run_interactive() {
     }
 }
 
-void LLM::run_inference(const std::vector<std::string>& input_texts) {
+void LLM::tokenize(const std::vector<std::string>& input_texts,
+                   std::vector<int>& token_ids,
+                   int& batch_size,
+                   int& seq_length) {
     // Tokenize inputs
-    std::vector<std::vector<int>> token_batches;
-    size_t max_seq_length = 0;
-    
+    std::vector<std::vector<int>> token_ids_batches;
+    seq_length = 0;
+
     std::cout << "Tokenizing input texts..." << std::endl;
     for (const auto& text : input_texts) {
-        std::vector<int> tokens = tokenizer.tokenize(text);
-        if (tokens.size() > n_ctx) {
+        std::vector<int> token_ids_i = tokenizer.tokenize(text);
+        if (token_ids_i.size() > n_ctx) {
             std::cout << "WARNING: Input too long, truncating to " << n_ctx << " tokens." << std::endl;
-            tokens.resize(n_ctx);
+            token_ids_i.resize(n_ctx);
         }
-        max_seq_length = std::max(max_seq_length, tokens.size());
-        token_batches.push_back(std::move(tokens));
+        seq_length = std::max(seq_length, (int)token_ids_i.size());
+        token_ids_batches.push_back(std::move(token_ids_i));
     }
-    
+
     // Pad sequences to the same length with EOS token
-    for (auto& tokens : token_batches) {
-        tokens.resize(max_seq_length, tokenizer.eos_token_id());
+    for (auto& token_ids_i : token_ids_batches) {
+        token_ids_i.resize(seq_length, tokenizer.eos_token_id());
     }
-    
-    size_t batch_size = token_batches.size();
-    std::vector<int> h_token_ids(batch_size * max_seq_length);
-    
-    // Flatten token_batches into h_token_ids
+
+    batch_size = token_ids_batches.size();
+    token_ids.resize(batch_size * seq_length);
+
+    // Flatten token_batches into token_ids
     for (size_t i = 0; i < batch_size; ++i) {
-        std::copy(token_batches[i].begin(), token_batches[i].end(), h_token_ids.begin() + i * max_seq_length);
+        std::copy(token_ids_batches[i].begin(),
+                  token_ids_batches[i].end(),
+                  token_ids.begin() + i * seq_length);
+    }
+}
+
+void LLM::write_token_ids(const std::string& h5_file_path,
+                          const std::vector<int>& token_ids,
+                          int batch_size,
+                          int seq_length) {
+    // Write token IDs to H5 file
+    hid_t file_id = H5Fcreate(h5_file_path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+    if (file_id < 0) {
+        throw std::runtime_error("Error: Cannot create H5 file");
     }
     
+    // Create dataset for token IDs
+    hsize_t dims[1] = {token_ids.size()};
+    hid_t dataspace_id = H5Screate_simple(1, dims, nullptr);
+    hid_t dataset_id = H5Dcreate(file_id, "/token_ids", H5T_NATIVE_INT, dataspace_id, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    
+    // Write token IDs data
+    H5Dwrite(dataset_id, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, token_ids.data());
+    
+    // Create attribute space (scalar)
+    hid_t attr_space = H5Screate(H5S_SCALAR);
+    
+    // Create and write batch_size attribute
+    hid_t attr_id_batch = H5Acreate(dataset_id, "batch_size", H5T_NATIVE_INT, attr_space, H5P_DEFAULT, H5P_DEFAULT);
+    H5Awrite(attr_id_batch, H5T_NATIVE_INT, &batch_size);
+    H5Aclose(attr_id_batch);
+    
+    // Create and write seq_length attribute
+    hid_t attr_id_seq = H5Acreate(dataset_id, "seq_length", H5T_NATIVE_INT, attr_space, H5P_DEFAULT, H5P_DEFAULT);
+    H5Awrite(attr_id_seq, H5T_NATIVE_INT, &seq_length);
+    H5Aclose(attr_id_seq);
+    
+    // Close resources
+    H5Sclose(attr_space);
+    H5Dclose(dataset_id);
+    H5Sclose(dataspace_id);
+    H5Fclose(file_id);
+}
+
+void LLM::load_token_ids(const std::string& h5_file_path,
+                         std::vector<int>& token_ids,
+                         int& batch_size,
+                         int& seq_length) {
+    // Load token IDs from H5 file
+    hid_t file_id = H5Fopen(h5_file_path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+    if (file_id < 0) {
+        throw std::runtime_error("Error: Cannot open H5 file");
+    }
+    
+    // Open the dataset
+    hid_t dataset_id = H5Dopen(file_id, "/token_ids", H5P_DEFAULT);
+    if (dataset_id < 0) {
+        H5Fclose(file_id);
+        throw std::runtime_error("Error: Cannot open dataset");
+    }
+    
+    // Get the dataspace to determine the size
+    hid_t dataspace_id = H5Dget_space(dataset_id);
+    hsize_t dims[1];
+    H5Sget_simple_extent_dims(dataspace_id, dims, NULL);
+    
+    // Resize the vector to hold the data
+    token_ids.resize(dims[0]);
+    
+    // Read token IDs data
+    H5Dread(dataset_id, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, token_ids.data());
+    
+    // Read batch_size attribute
+    hid_t attr_id_batch = H5Aopen(dataset_id, "batch_size", H5P_DEFAULT);
+    H5Aread(attr_id_batch, H5T_NATIVE_INT, &batch_size);
+    H5Aclose(attr_id_batch);
+
+    // Read seq_length attribute
+    hid_t attr_id_seq = H5Aopen(dataset_id, "seq_length", H5P_DEFAULT);
+    H5Aread(attr_id_seq, H5T_NATIVE_INT, &seq_length);
+    H5Aclose(attr_id_seq);
+
+    // Close resources
+    H5Sclose(dataspace_id);
+    H5Dclose(dataset_id);
+    H5Fclose(file_id);
+}
+
+void LLM::tokenize_write_and_run_inference(const std::vector<std::string>& input_texts) {
+    // Tokenize input
+    int batch_size, seq_length;
+    std::vector<int> token_ids;
+    tokenize(input_texts, token_ids, batch_size, seq_length);
+
+    // Write token IDs to H5 file
+    std::string h5_file_path = "token_ids.h5";
+    write_token_ids(h5_file_path, token_ids, batch_size, seq_length);
+
     // Run inference
+    run_inference(token_ids, batch_size, seq_length);
+}
+
+void LLM::load_tokens_and_run_inference(const std::string& h5_file_path) {
+    // Load token IDs from H5 file
+    int batch_size, seq_length;
+    std::vector<int> token_ids;
+    load_token_ids(h5_file_path, token_ids, batch_size, seq_length);
+
+    // Run inference
+    run_inference(token_ids, batch_size, seq_length);
+}
+
+void LLM::run_inference(const std::vector<int>& token_ids,
+                        int batch_size,
+                        int seq_length) {
     std::cout << "Running inference on " << batch_size
-              << " input texts of max length " << max_seq_length
+              << " input sequences of max length " << seq_length
               << "..." << std::endl;
     std::vector<int> generated_ids;
-    generate_text_recursive(h_token_ids, generated_ids, batch_size, max_seq_length);
+    generate_text_recursive(token_ids, generated_ids, batch_size, seq_length);
 }
 
 
