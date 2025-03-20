@@ -548,6 +548,7 @@ void LLM::generate_text_recursive(const std::vector<int>& input_ids,
         // Print the token if batch size is 1
         if (batch_size == 1) {
             std::string token_str = tokenizer.detokenize({next_ids[0]});
+            std::cout << token_str;
             std::flush(std::cout);
         }
 
