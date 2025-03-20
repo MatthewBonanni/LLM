@@ -263,7 +263,7 @@ __global__ void mlp_kernel(float* input, float* output,
 
 __global__ void lm_head_kernel(float* hidden_state, float* logits,
                                float* weights, float* biases,
-                               int batch_size, int n_vocab, int n_embd) {
+                               int batch_size, int seq_length, int n_vocab, int n_embd) {
     // Calculate thread ID
     int idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
     int idx_vocab = blockIdx.y * blockDim.y + threadIdx.y;
@@ -278,7 +278,7 @@ __global__ void lm_head_kernel(float* hidden_state, float* logits,
     int idx_out = (idx_batch * n_vocab + idx_vocab);
 
     // Get the starting index for the current token
-    int offset_input = idx_batch * n_embd;
+    int offset_input =  (idx_batch * seq_length + (seq_length - 1)) * n_embd;
     int offset_weights = idx_vocab * n_embd;
 
     // Compute logits

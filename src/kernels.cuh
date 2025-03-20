@@ -27,4 +27,4 @@ __global__ void mlp_kernel(float* input, float* output,
                            int batch_size, int seq_length, int n_embd);
 __global__ void lm_head_kernel(float* hidden_state, float* logits,
                                float* weights, float* biases,
-                               int batch_size, int n_vocab, int n_embd);
+                               int batch_size, int seq_length, int n_vocab, int n_embd);

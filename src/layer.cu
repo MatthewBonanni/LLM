@@ -75,10 +75,10 @@ void Layer::apply(float* d_hidden_states, float* d_residual, float* d_temp, int 
 
     // Allocate temporary buffers
     float* d_qkv = nullptr;
-    CHECK_CUDA(cudaMalloc(&d_qkv, seq_length * 3 * n_embd * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_qkv, batch_size * seq_length * 3 * n_embd * sizeof(float)));
     
     // Step 1: Save input for residual connection
-    CHECK_CUDA(cudaMemcpy(d_residual, d_hidden_states, seq_length * n_embd * sizeof(float), cudaMemcpyDeviceToDevice));
+    CHECK_CUDA(cudaMemcpy(d_residual, d_hidden_states, batch_size * seq_length * n_embd * sizeof(float), cudaMemcpyDeviceToDevice));
     
     // Step 2: First layer normalization
     // Each thread handles one token (i_batch, i_sequence, :)

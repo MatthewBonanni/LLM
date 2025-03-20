@@ -42,11 +42,16 @@ void LLM::print() {
     printf("--------------------------------\n");
     printf("LLM Configuration\n");
     printf("--------------------------------\n");
-    printf("n_vocab: %d\n", n_vocab);
-    printf("n_ctx: %d\n", n_ctx);
-    printf("n_embd: %d\n", n_embd);
-    printf("n_head: %d\n", n_head);
-    printf("n_layer: %d\n", n_layer);
+    printf("Model hyperparameters:\n");
+    printf("> n_vocab: %d\n", n_vocab);
+    printf("> n_ctx: %d\n", n_ctx);
+    printf("> n_embd: %d\n", n_embd);
+    printf("> n_head: %d\n", n_head);
+    printf("> n_layer: %d\n", n_layer);
+    printf("Runtime parameters:\n");
+    printf("> max_out_length: %d\n", max_out_length);
+    printf("> temperature: %.2f\n", temperature);
+    printf("> n_top_predictions: %d\n", n_top_predictions);
     printf("--------------------------------\n");
 }
 
@@ -123,7 +128,8 @@ void LLM::apply_embeddings(int* d_token_ids, float* d_embeddings, int batch_size
                    (seq_length + block_size.y - 1) / block_size.y,
                    (n_embd     + block_size.z - 1) / block_size.z);
     embedding_kernel<<<grid_size, block_size>>>(
-        d_token_ids, d_wte_0, d_wpe_0, d_embeddings, batch_size, seq_length, n_embd);
+        d_token_ids, d_wte_0, d_wpe_0, d_embeddings,
+        batch_size, seq_length, n_embd);
 }
 
 void LLM::apply_final_layer_norm(float* d_hidden_states, int batch_size, int seq_length) {
@@ -134,7 +140,8 @@ void LLM::apply_final_layer_norm(float* d_hidden_states, int batch_size, int seq
                    (seq_length + block_size.y - 1) / block_size.y,
                    1);
     layer_normalization_kernel<<<grid_size, block_size>>>(
-        d_hidden_states, d_ln_f_g_0, d_ln_f_b_0, batch_size, seq_length, n_embd);
+        d_hidden_states, d_ln_f_g_0, d_ln_f_b_0,
+        batch_size, seq_length, n_embd);
 }
 
 void LLM::apply_lm_head(float* d_hidden_state, float* d_logits, int batch_size, int seq_length) {
@@ -146,7 +153,8 @@ void LLM::apply_lm_head(float* d_hidden_state, float* d_logits, int batch_size, 
                    (n_vocab    + block_size.y - 1) / block_size.y,
                    1);
     lm_head_kernel<<<grid_size, block_size>>>(
-        d_hidden_state, d_logits, d_wte_0, nullptr, batch_size, n_vocab, n_embd);
+        d_hidden_state, d_logits, d_wte_0, nullptr,
+        batch_size, seq_length, n_vocab, n_embd);
 }
 
 void LLM::copy_params_host_to_device() {
