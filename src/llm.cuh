@@ -64,14 +64,14 @@ class LLM {
                                std::vector<int>& context_ids,
                                const std::vector<int>& new_ids,
                                int batch_size,
-                               int seq_length);
+                               int& seq_length);
         bool all_eos(const std::vector<int>& ids,
                      int batch_size,
                      int seq_length);
         void generate_text_recursive(const std::vector<int>& input_ids,
                                      std::vector<int>& generated_ids,
                                      int batch_size,
-                                     int seq_length);
+                                     int& seq_length);
         void clean_up_memory(const std::vector<void*>& buffers);
 
         // Model hyperparameters

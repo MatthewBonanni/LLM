@@ -194,7 +194,14 @@ void LLM::run_interactive() {
         // TODO: Give prior conversation as context
         std::cout << "Generated: ";
         std::vector<int> generated_ids;
-        generate_text_recursive(h_token_ids, generated_ids, 1, h_token_ids.size());
+        int seq_length = h_token_ids.size();
+        generate_text_recursive(h_token_ids, generated_ids, 1, seq_length);
+
+        // Print generated tokens
+        for (int id : generated_ids) {
+            std::string token_str = tokenizer.detokenize({id});
+            std::cout << token_str << " ";
+        }
         std::cout << std::endl;
     }
 }
@@ -360,7 +367,7 @@ std::vector<float> LLM::forward_pass(const std::vector<int>& token_ids,
     float* d_residual = nullptr;
     float* d_temp = nullptr;
     float* d_logits = nullptr;
-    std::vector<float> h_logits(n_vocab);
+    std::vector<float> h_logits(batch_size * n_vocab);
 
     int token_count = token_ids.size();
     if (token_ids.size() != batch_size * seq_length) {
@@ -466,7 +473,7 @@ void LLM::append_new_tokens(std::vector<int>& generated_ids,
                             std::vector<int>& context_ids,
                             const std::vector<int>& new_ids,
                             int batch_size,
-                            int seq_length) {
+                            int& seq_length) {
     // Handle generated tokens (accumulating generated tokens)
     // Expand generated tokens
     int seq_length_generated = generated_ids.size() / batch_size;
@@ -494,6 +501,8 @@ void LLM::append_new_tokens(std::vector<int>& generated_ids,
             }
             context_ids[i * (seq_length + 1) + seq_length] = new_ids[i];
         }
+
+        seq_length++;
     } else {
         // Shift context tokens to the left and add new token at the end
         for (int i = 0; i < batch_size; i++) {
@@ -519,7 +528,7 @@ bool LLM::all_eos(const std::vector<int>& ids,
 void LLM::generate_text_recursive(const std::vector<int>& input_ids,
                                   std::vector<int>& generated_ids,
                                   int batch_size,
-                                  int seq_length) {
+                                  int& seq_length) {
     std::flush(std::cout);
     std::vector<int> context_ids = input_ids;
     
