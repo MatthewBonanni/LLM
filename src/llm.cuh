@@ -55,11 +55,9 @@ class LLM {
                            int batch_size,
                            int seq_length);
         std::vector<std::pair<float, int>> get_top_predictions(const std::vector<float>& logits,
-                                                               int batch_size,
-                                                               int seq_length);
+                                                               int batch_size);
         std::vector<int> sample_tokens(const std::vector<std::pair<float, int>>& probabilities,
-                                       int batch_size,
-                                       int seq_length);
+                                       int batch_size);
         void append_new_tokens(std::vector<int>& generated_ids,
                                std::vector<int>& context_ids,
                                const std::vector<int>& new_ids,

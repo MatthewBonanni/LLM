@@ -419,8 +419,7 @@ std::vector<float> LLM::forward_pass(const std::vector<int>& token_ids,
 }
 
 std::vector<std::pair<float, int>> LLM::get_top_predictions(const std::vector<float>& logits,
-                                                            int batch_size,
-                                                            int seq_length) {
+                                                            int batch_size) {
     std::vector<std::pair<float, int>> probs;
     probs.reserve(batch_size * n_vocab);
 
@@ -455,8 +454,7 @@ std::vector<std::pair<float, int>> LLM::get_top_predictions(const std::vector<fl
 }
 
 std::vector<int> LLM::sample_tokens(const std::vector<std::pair<float, int>>& probabilities,
-                                    int batch_size,
-                                    int seq_length) {
+                                    int batch_size) {
     // Sample based on adjusted probabilities
     static std::random_device rd;
     static std::mt19937 gen(rd());
@@ -465,8 +463,8 @@ std::vector<int> LLM::sample_tokens(const std::vector<std::pair<float, int>>& pr
     for (int i = 0; i < batch_size; i++) {
         float r = dis(gen);
         float cdf = 0.0f;
-        for (int j = 0; j < seq_length; j++) {
-            auto& p = probabilities[i * seq_length + j];
+        for (int j = 0; j < n_vocab; j++) {
+            auto& p = probabilities[i * n_vocab + j];
             cdf += p.first;
             if (r <= cdf) {
                 sampled_tokens[i] = p.second;
@@ -545,10 +543,10 @@ void LLM::generate_text_recursive(const std::vector<int>& input_ids,
         std::vector<float> logits = forward_pass(context_ids, batch_size, seq_length);
         
         // Get predictions
-        std::vector<std::pair<float, int>> probabilities = get_top_predictions(logits, batch_size, seq_length);
+        std::vector<std::pair<float, int>> probabilities = get_top_predictions(logits, batch_size);
         
         // Sample next token
-        std::vector<int> next_ids = sample_tokens(probabilities, batch_size, seq_length);
+        std::vector<int> next_ids = sample_tokens(probabilities, batch_size);
         
         // Add to generated sequence
         append_new_tokens(generated_ids, context_ids, next_ids, batch_size, seq_length);
