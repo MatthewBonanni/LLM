@@ -19,17 +19,42 @@ class LLM {
         void load_hparams(std::string model_path);
         void load_model(std::string model_path);
         void run_interactive();
-        void run_inference(const std::string& input_text);
+        void run_inference(const std::vector<std::string>& input_texts);
 
     private:
         void copy_params_host_to_device();
-        void apply_embeddings(int* d_token_ids, float* d_embeddings, int token_count);
-        std::vector<float> forward_pass(const std::vector<int>& h_token_ids);
-        void apply_final_layer_norm(float* d_hidden_states, int seq_length);
-        void apply_lm_head(float* d_hidden_states, float* d_logits);
-        std::vector<std::pair<float, int>> get_top_predictions(const std::vector<float>& logits);
-        int sample_token(const std::vector<std::pair<float, int>>& probabilities);
-        void generate_text(const std::vector<int>& input_ids);
+        void apply_embeddings(int* d_token_ids,
+                              float* d_embeddings,
+                              int batch_size,
+                              int seq_length);
+        std::vector<float> forward_pass(const std::vector<int>& token_ids,
+                                        int batch_size,
+                                        int seq_length);
+        void apply_final_layer_norm(float* d_hidden_states,
+                                    int batch_size,
+                                    int seq_length);
+        void apply_lm_head(float* d_hidden_states,
+                           float* d_logits,
+                           int batch_size,
+                           int seq_length);
+        std::vector<std::pair<float, int>> get_top_predictions(const std::vector<float>& logits,
+                                                               int batch_size,
+                                                               int seq_length);
+        std::vector<int> sample_tokens(const std::vector<std::pair<float, int>>& probabilities,
+                                       int batch_size,
+                                       int seq_length);
+        void append_new_tokens(std::vector<int>& generated_ids,
+                               std::vector<int>& context_ids,
+                               const std::vector<int>& new_ids,
+                               int batch_size,
+                               int seq_length);
+        bool all_eos(const std::vector<int>& ids,
+                     int batch_size,
+                     int seq_length);
+        void generate_text_recursive(const std::vector<int>& input_ids,
+                                     std::vector<int>& generated_ids,
+                                     int batch_size,
+                                     int seq_length);
         void clean_up_memory(const std::vector<void*>& buffers);
 
         // Model hyperparameters

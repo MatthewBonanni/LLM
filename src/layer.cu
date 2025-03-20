@@ -68,10 +68,10 @@ Layer::~Layer() {
     CHECK_CUDA(cudaFree(d_mlp_c_proj_b_0));
 }
 
-void Layer::apply(float* d_hidden_states, float* d_residual, float* d_temp, int seq_length) {
-    // Calculate dimensions
-    int block_size = 256; // Using a fixed block size that works well for most cases
-    int grid_size = (seq_length * n_embd + block_size - 1) / block_size;
+void Layer::apply(float* d_hidden_states, float* d_residual, float* d_temp, int batch_size, int seq_length) {
+    // Dimensions
+    dim3 grid_size;
+    dim3 block_size;
 
     // Allocate temporary buffers
     float* d_qkv = nullptr;
@@ -81,54 +81,122 @@ void Layer::apply(float* d_hidden_states, float* d_residual, float* d_temp, int 
     CHECK_CUDA(cudaMemcpy(d_residual, d_hidden_states, seq_length * n_embd * sizeof(float), cudaMemcpyDeviceToDevice));
     
     // Step 2: First layer normalization
+    // Each thread handles one token (i_batch, i_sequence, :)
+    // in the hidden states (batch, sequence, embedding)
+    block_size.x = 32;
+    block_size.y = 32;
+    block_size.z = 1;
+    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
+    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
+    grid_size.z = 1;
     layer_normalization_kernel<<<grid_size, block_size>>>(
-        d_hidden_states, d_ln_1_g_0, d_ln_1_b_0, seq_length, n_embd);
+        d_hidden_states, d_ln_1_g_0, d_ln_1_b_0,
+        batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
 
     // Step 3: Multi-head attention
     // Step 3.1: QKV projection
+    // Each thread handles one token (i_batch, i_sequence, :)
+    // in the QKV (batch, sequence, embedding)
+    block_size.x = 32;
+    block_size.y = 32;
+    block_size.z = 1;
+    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
+    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
+    grid_size.z = 1;
     qkv_projection_kernel<<<grid_size, block_size>>>(
         d_hidden_states, d_qkv, 
         d_attn_c_attn_w_0, d_attn_c_attn_b_0, 
-        seq_length, n_embd, 3 * n_embd);
+        batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
 
     // Step 3.2: Multi-head attention
+    // Each thread handles one token (i_batch, i_sequence, :)
+    // in the hidden states (batch, sequence, embedding)
+    block_size.x = 32;
+    block_size.y = 32;
+    block_size.z = 1;
+    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
+    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
+    grid_size.z = 1;
     multi_head_attention_kernel<<<grid_size, block_size>>>(
         d_qkv, d_hidden_states, 
-        seq_length, n_embd, n_head);
+        batch_size, seq_length, n_head, n_embd);
     CHECK_CUDA(cudaGetLastError());
 
     // Step 3.3: Final projection
+    // Each thread handles one token (i_batch, i_sequence, :)
+    // in the hidden states (batch, sequence, embedding)
+    block_size.x = 32;
+    block_size.y = 32;
+    block_size.z = 1;
+    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
+    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
+    grid_size.z = 1;
     final_projection_kernel<<<grid_size, block_size>>>(
         d_hidden_states, d_temp,
         d_attn_c_proj_w_0, d_attn_c_proj_b_0,
-        seq_length, n_embd);
+        batch_size, seq_length, n_embd);
 
     // Step 4: Add residual connection
+    // Each thread handles one token (i_batch, i_sequence, :)
+    // in the hidden states (batch, sequence, embedding)
+    block_size.x = 32;
+    block_size.y = 32;
+    block_size.z = 1;
+    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
+    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
+    grid_size.z = 1;
     add_residual_kernel<<<grid_size, block_size>>>(
-        d_temp, d_residual, d_hidden_states, seq_length, n_embd);
+        d_temp, d_residual, d_hidden_states,
+        batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
 
     // Step 5: Save output for residual connection
     CHECK_CUDA(cudaMemcpy(d_residual, d_hidden_states, seq_length * n_embd * sizeof(float), cudaMemcpyDeviceToDevice));
 
     // Step 6: Second layer normalization
+    // Each thread handles one token (i_batch, i_sequence, :)
+    // in the hidden states (batch, sequence, embedding)
+    block_size.x = 32;
+    block_size.y = 32;
+    block_size.z = 1;
+    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
+    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
+    grid_size.z = 1;
     layer_normalization_kernel<<<grid_size, block_size>>>(
-        d_hidden_states, d_ln_2_g_0, d_ln_2_b_0, seq_length, n_embd);
+        d_hidden_states, d_ln_2_g_0, d_ln_2_b_0,
+        batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
 
     // Step 7: MLP (feedforward network)
+    // Each thread handles one token (i_batch, i_sequence, :)
+    // in the hidden states (batch, sequence, embedding)
+    block_size.x = 32;
+    block_size.y = 32;
+    block_size.z = 1;
+    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
+    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
+    grid_size.z = 1;
     mlp_kernel<<<grid_size, block_size>>>(
         d_hidden_states, d_temp,
         d_mlp_c_fc_w_0, d_mlp_c_fc_b_0,
         d_mlp_c_proj_w_0, d_mlp_c_proj_b_0,
-        seq_length, n_embd);
+        batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
 
     // Step 8: Add residual connection
+    // Each thread handles one token (i_batch, i_sequence, :)
+    // in the hidden states (batch, sequence, embedding)
+    block_size.x = 32;
+    block_size.y = 32;
+    block_size.z = 1;
+    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
+    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
+    grid_size.z = 1;
     add_residual_kernel<<<grid_size, block_size>>>(
-        d_temp, d_residual, d_hidden_states, seq_length, n_embd);
+        d_temp, d_residual, d_hidden_states,
+        batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
 
     // Free temporary buffers

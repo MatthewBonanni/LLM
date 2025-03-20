@@ -22,10 +22,29 @@ int main(int argc, char **argv) {
             throw std::runtime_error("Could not open file: " + std::string(argv[1]));
         }
 
-        std::string content((std::istreambuf_iterator<char>(input_file)),
-                            (std::istreambuf_iterator<char>()          ));
-        std::cout << "Input text: " << content << std::endl;
-        model.run_inference(content);
+        // Read file line by line and group into texts
+        std::vector<std::string> texts;
+        std::string line;
+        std::string content;
+        while (std::getline(input_file, line)) {
+            if (line.empty()) {
+                if (!content.empty()) {
+                    texts.push_back(content);
+                    content.clear();
+                }
+            } else {
+                if (!content.empty()) {
+                    content += "\n";
+                }
+                content += line;
+            }
+        }
+
+        if (!content.empty()) {
+            texts.push_back(content);
+        }
+
+        model.run_inference(texts);
     } else {
         model.run_interactive();
     }
