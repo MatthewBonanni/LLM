@@ -91,7 +91,7 @@ std::vector<int> Tokenizer::tokenize(const std::string& text) {
     std::vector<std::string> words;
     std::string word;
     for (auto it = words_begin; it != words_end; ++it) {
-        word = replace_spaces_with_G(it->str());
+        word = replace_characters_tokenize(it->str());
         words.push_back(word);
     }
 
@@ -125,6 +125,7 @@ std::string Tokenizer::detokenize(const std::vector<int>& tokens) {
             std::cerr << "Warning: Unknown token ID '" << token_id << "'\n";
         }
     }
+    text = replace_characters_detokenize(text);
     return text;
 }
 
@@ -164,12 +165,18 @@ std::vector<std::string> Tokenizer::apply_bpe(const std::vector<std::string>& ch
     return tokens;
 }
 
-std::string Tokenizer::replace_spaces_with_G(const std::string& input) {
-    return std::regex_replace(input, std::regex(" "), "Ġ");
+std::string Tokenizer::replace_characters_tokenize(const std::string& input) {
+    std::string output = input;
+    output = std::regex_replace(output, std::regex(" "), "Ġ");
+    output = std::regex_replace(output, std::regex("\n"), "Ċ");
+    return output;
 }
 
-std::string Tokenizer::replace_G_with_spaces(const std::string& input) {
-    return std::regex_replace(input, std::regex("Ġ"), " ");
+std::string Tokenizer::replace_characters_detokenize(const std::string& input) {
+    std::string output = input;
+    output = std::regex_replace(output, std::regex("Ġ"), " ");
+    output = std::regex_replace(output, std::regex("Ċ"), "\n");
+    return output;
 }
 
 std::vector<std::string> Tokenizer::split_utf8_chars(const std::string& input) {

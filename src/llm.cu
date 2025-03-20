@@ -186,11 +186,12 @@ void LLM::run_interactive() {
         // If input is too long, truncate
         if (h_token_ids.size() > n_ctx) {
             h_token_ids.resize(n_ctx);
-            std::cout << "Input too long, truncating to " << n_ctx << " tokens." << std::endl;
+            std::cout << "WARNING: Input too long, truncating to " << n_ctx << " tokens." << std::endl;
         }
 
         // Generate text
         // TODO: Give prior conversation as context
+        std::cout << "Generated: ";
         std::vector<int> generated_ids;
         generate_text_recursive(h_token_ids, generated_ids, 1, h_token_ids.size());
         std::cout << std::endl;
@@ -202,6 +203,7 @@ void LLM::run_inference(const std::vector<std::string>& input_texts) {
     std::vector<std::vector<int>> token_batches;
     size_t max_seq_length = 0;
     
+    std::cout << "Tokenizing input texts..." << std::endl;
     for (const auto& text : input_texts) {
         std::vector<int> tokens = tokenizer.tokenize(text);
         if (tokens.size() > n_ctx) {
@@ -226,6 +228,9 @@ void LLM::run_inference(const std::vector<std::string>& input_texts) {
     }
     
     // Run inference
+    std::cout << "Running inference on " << batch_size
+              << " input texts of max length " << max_seq_length
+              << "..." << std::endl;
     std::vector<int> generated_ids;
     generate_text_recursive(h_token_ids, generated_ids, batch_size, max_seq_length);
 }
@@ -400,7 +405,6 @@ void LLM::generate_text_recursive(const std::vector<int>& input_ids,
                                   std::vector<int>& generated_ids,
                                   int batch_size,
                                   int seq_length) {
-    std::cout << "Generated: ";
     std::flush(std::cout);
     std::vector<int> context_ids = input_ids;
     
@@ -420,7 +424,6 @@ void LLM::generate_text_recursive(const std::vector<int>& input_ids,
         // Print the token if batch size is 1
         if (batch_size == 1) {
             std::string token_str = tokenizer.detokenize({next_ids[0]});
-            std::cout << tokenizer.replace_G_with_spaces(token_str);
             std::flush(std::cout);
         }
 
