@@ -121,15 +121,16 @@ void LLM::load_model(std::string model_path) {
 }
 
 void LLM::apply_embeddings(int* d_token_ids, float* d_embeddings, int batch_size, int seq_length) {
-    // Each thread handles one element (i_batch, i_sequence, i_embedding)
-    // in the embedding matrix (batch, sequence, embedding)
+    // Each thread handles one token (i_batch, i_sequence, :)
+    // in the token_ids (batch, sequence, embedding)
     dim3 block_size(32, 32, 1);
     dim3 grid_size((batch_size + block_size.x - 1) / block_size.x,
                    (seq_length + block_size.y - 1) / block_size.y,
-                   (n_embd     + block_size.z - 1) / block_size.z);
+                   1);
     embedding_kernel<<<grid_size, block_size>>>(
         d_token_ids, d_wte_0, d_wpe_0, d_embeddings,
         batch_size, seq_length, n_embd);
+    CHECK_CUDA(cudaGetLastError());
 }
 
 void LLM::apply_final_layer_norm(float* d_hidden_states, int batch_size, int seq_length) {
@@ -142,6 +143,7 @@ void LLM::apply_final_layer_norm(float* d_hidden_states, int batch_size, int seq
     layer_normalization_kernel<<<grid_size, block_size>>>(
         d_hidden_states, d_ln_f_g_0, d_ln_f_b_0,
         batch_size, seq_length, n_embd);
+    CHECK_CUDA(cudaGetLastError());
 }
 
 void LLM::apply_lm_head(float* d_hidden_state, float* d_logits, int batch_size, int seq_length) {
@@ -155,6 +157,7 @@ void LLM::apply_lm_head(float* d_hidden_state, float* d_logits, int batch_size, 
     lm_head_kernel<<<grid_size, block_size>>>(
         d_hidden_state, d_logits, d_wte_0, nullptr,
         batch_size, seq_length, n_vocab, n_embd);
+    CHECK_CUDA(cudaGetLastError());
 }
 
 void LLM::copy_params_host_to_device() {
@@ -383,6 +386,18 @@ std::vector<float> LLM::forward_pass(const std::vector<int>& token_ids,
     }
 
     // Allocate device memory
+    std::cout << "HERE: ALLOCATING DEVICE MEMORY" << std::endl;
+    size_t free_memory, total_memory;
+    cudaMemGetInfo(&free_memory, &total_memory);
+    std::cout << "Total GPU memory: " << total_memory / (1024 * 1024) << " MB" << std::endl;
+    std::cout << "Free GPU memory: " << free_memory / (1024 * 1024) << " MB" << std::endl;
+    size_t required_memory = token_count * sizeof(int) +
+                             token_count * n_embd * sizeof(float) * 3 +
+                             batch_size * n_vocab * sizeof(float);
+    std::cout << "Required GPU memory: " << required_memory / (1024 * 1024) << " MB" << std::endl;
+    if (required_memory > free_memory) {
+        throw std::runtime_error("Not enough GPU memory available for allocation.");
+    }
     CHECK_CUDA(cudaMalloc(&d_token_ids, token_count * sizeof(int)));
     CHECK_CUDA(cudaMalloc(&d_hidden_states, token_count * n_embd * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_residual, token_count * n_embd * sizeof(float)));
@@ -556,6 +571,8 @@ void LLM::generate_text_recursive(const std::vector<int>& input_ids,
             std::string token_str = tokenizer.detokenize({next_ids[0]});
             std::cout << token_str;
             std::flush(std::cout);
+        } else {
+            std::cout << "Finished generating " << gen_idx + 1 << " tokens." << std::endl;
         }
 
         // Check for EOS token

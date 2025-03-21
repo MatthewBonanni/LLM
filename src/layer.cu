@@ -137,6 +137,7 @@ void Layer::apply(float* d_hidden_states, float* d_residual, float* d_temp, int 
         d_hidden_states, d_temp,
         d_attn_c_proj_w_0, d_attn_c_proj_b_0,
         batch_size, seq_length, n_embd);
+    CHECK_CUDA(cudaGetLastError());
 
     // Step 4: Add residual connection
     // Each thread handles one token (i_batch, i_sequence, :)

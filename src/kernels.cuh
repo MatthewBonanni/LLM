@@ -2,8 +2,8 @@
 
 #include <cuda_runtime.h>
 
-#define INTERMEDIATE_SIZE_MAX 4096
-#define SEQ_LENGTH_MAX 2048
+#define INTERMEDIATE_SIZE_MAX 3072
+#define SEQ_LENGTH_MAX 1024
 
 __device__ __host__ float gelu(float x);
 __global__ void embedding_kernel(int* token_ids, float* wte, float* wpe, float* embeddings,

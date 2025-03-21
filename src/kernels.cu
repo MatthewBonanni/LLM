@@ -9,37 +9,35 @@ __device__ __host__ float gelu(float x) {
 __global__ void embedding_kernel(int* token_ids, float* wte, float* wpe, float* embeddings,
                                  int batch_size, int seq_length, int n_embd) {
     // Calculate thread ID
-    int idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    int idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
-    int idx_embd  = blockIdx.z * blockDim.z + threadIdx.z;
+    size_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
 
     // Check bounds
     if (idx_batch >= batch_size ||
-        idx_seq   >= seq_length ||
-        idx_embd  >= n_embd) {
+        idx_seq   >= seq_length) {
         return;
     }
     
     // Get token ID for current position
     int token_id = token_ids[idx_batch * seq_length + idx_seq];
-    
-    // Calculate output index
-    int idx_out = (idx_batch * seq_length + idx_seq) * n_embd + idx_embd;
-    
-    // Calculate embedding indices
-    int idx_wte = token_id * n_embd + idx_embd;  // Token embedding
-    int idx_wpe = idx_seq * n_embd + idx_embd;   // Position embedding
-    
-    // Combine token embedding and position embedding
-    embeddings[idx_out] = wte[idx_wte] + wpe[idx_wpe];
+
+    // Calculate offsets
+    size_t offset_out = (idx_batch * seq_length + idx_seq) * n_embd;
+    size_t offset_wte = token_id * n_embd;
+    size_t offset_wpe = idx_seq * n_embd;
+
+    // Perform embedding lookup
+    for (int i = 0; i < n_embd; i++) {
+        embeddings[offset_out + i] = wte[offset_wte + i] + wpe[offset_wpe + i];
+    }
 }
 
 __global__ void qkv_projection_kernel(float* input, float* output,
                                       float* w_qkv, float* b_qkv,
                                       int batch_size, int seq_length, int n_embd) {
     // Calculate thread ID
-    int idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    int idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
+    size_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
 
     // Check bounds
     if (idx_batch >= batch_size ||
@@ -48,8 +46,8 @@ __global__ void qkv_projection_kernel(float* input, float* output,
     }
 
     // Get the starting index for the current token
-    int offset_input = (idx_batch * seq_length + idx_seq) * n_embd;
-    int offset_output = (idx_batch * seq_length + idx_seq) * (3 * n_embd);
+    size_t offset_input = (idx_batch * seq_length + idx_seq) * n_embd;
+    size_t offset_output = (idx_batch * seq_length + idx_seq) * (3 * n_embd);
     int qkv_size = 3 * n_embd; // Size of Q, K, V for each token
 
     // Perform QKV projection
@@ -66,8 +64,8 @@ __global__ void layer_normalization_kernel(float* input,
                                            float* gamma, float* beta,
                                            int batch_size, int seq_length, int n_embd) {
     // Calculate thread ID
-    int idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    int idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
+    size_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
 
     // Check bounds
     if (idx_batch >= batch_size ||
@@ -76,7 +74,7 @@ __global__ void layer_normalization_kernel(float* input,
     }
 
     // Get the starting index for the current token
-    int offset_input = (idx_batch * seq_length + idx_seq) * n_embd;
+    size_t offset_input = (idx_batch * seq_length + idx_seq) * n_embd;
 
     // Calculate mean
     float mean = 0.0f;
@@ -106,8 +104,8 @@ __global__ void layer_normalization_kernel(float* input,
 __global__ void multi_head_attention_kernel(float* qkv, float* output,
                                             int batch_size, int seq_length, int n_head, int n_embd) {
     // Calculate thread ID
-    int idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    int idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
+    size_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
 
     // Check bounds
     if (idx_batch >= batch_size ||
@@ -178,8 +176,8 @@ __global__ void final_projection_kernel(float* input, float* output,
                                         float* w_proj, float* b_proj,
                                         int batch_size, int seq_length, int n_embd) {
     // Calculate thread ID
-    int idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    int idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
+    size_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
 
     // Check bounds
     if (idx_batch >= batch_size ||
@@ -188,7 +186,7 @@ __global__ void final_projection_kernel(float* input, float* output,
     }
 
     // Get the starting index for the current token
-    int offset_input = (idx_batch * seq_length + idx_seq) * n_embd;
+    size_t offset_input = (idx_batch * seq_length + idx_seq) * n_embd;
 
     // Perform final projection
     for (int i = 0; i < n_embd; i++) {
@@ -203,8 +201,8 @@ __global__ void final_projection_kernel(float* input, float* output,
 __global__ void add_residual_kernel(float* input, float* residual, float* output,
                                     int batch_size, int seq_length, int n_embd) {
     // Calculate thread ID
-    int idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    int idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
+    size_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
 
     // Check bounds
     if (idx_batch >= batch_size ||
@@ -213,7 +211,7 @@ __global__ void add_residual_kernel(float* input, float* residual, float* output
     }
 
     // Get the starting index for the current token
-    int offset = (idx_batch * seq_length + idx_seq) * n_embd;
+    size_t offset = (idx_batch * seq_length + idx_seq) * n_embd;
 
     // Add residual connection
     for (int i = 0; i < n_embd; i++) {
@@ -226,8 +224,8 @@ __global__ void mlp_kernel(float* input, float* output,
                            float* w_proj, float* b_proj,
                            int batch_size, int seq_length, int n_embd) {
     // Calculate thread ID
-    int idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    int idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
+    size_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
 
     // Check bounds
     if (idx_batch >= batch_size ||
@@ -240,7 +238,7 @@ __global__ void mlp_kernel(float* input, float* output,
     float intermediate[INTERMEDIATE_SIZE_MAX];
 
     // Get the starting index for the current token
-    int offset_input = (idx_batch * seq_length + idx_seq) * n_embd;
+    size_t offset_input = (idx_batch * seq_length + idx_seq) * n_embd;
 
     // Compute feedforward layer
     for (int i = 0; i < intermediate_size; i++) {
@@ -265,8 +263,8 @@ __global__ void lm_head_kernel(float* hidden_state, float* logits,
                                float* weights, float* biases,
                                int batch_size, int seq_length, int n_vocab, int n_embd) {
     // Calculate thread ID
-    int idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    int idx_vocab = blockIdx.y * blockDim.y + threadIdx.y;
+    size_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx_vocab = blockIdx.y * blockDim.y + threadIdx.y;
 
     // Check bounds
     if (idx_batch >= batch_size ||
@@ -275,11 +273,11 @@ __global__ void lm_head_kernel(float* hidden_state, float* logits,
     }
 
     // Calculate output index
-    int idx_out = (idx_batch * n_vocab + idx_vocab);
+    size_t idx_out = (idx_batch * n_vocab + idx_vocab);
 
     // Get the starting index for the current token
-    int offset_input =  (idx_batch * seq_length + (seq_length - 1)) * n_embd;
-    int offset_weights = idx_vocab * n_embd;
+    size_t offset_input =  (idx_batch * seq_length + (seq_length - 1)) * n_embd;
+    size_t offset_weights = idx_vocab * n_embd;
 
     // Compute logits
     logits[idx_out] = biases ? biases[idx_vocab] : 0.0f;
