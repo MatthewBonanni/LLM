@@ -40,39 +40,6 @@ __global__ void embedding_kernel(
     }
 }
 
-__global__ void qkv_projection_kernel(
-        fp_t* input,
-        fp_t* output,
-        fp_t* w_qkv,
-        fp_t* b_qkv,
-        uint32_t batch_size,
-        uint32_t seq_length,
-        uint32_t n_embd) {
-    // Calculate thread ID
-    uint32_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
-
-    // Check bounds
-    if (idx_batch >= batch_size ||
-        idx_seq   >= seq_length) {
-        return;
-    }
-
-    // Get the starting index for the current token
-    uint64_t offset_input  = ((uint64_t) idx_batch * seq_length + idx_seq) * n_embd;
-    uint64_t offset_output = ((uint64_t) idx_batch * seq_length + idx_seq) * (3 * n_embd);
-    uint32_t qkv_size = 3 * n_embd; // Size of Q, K, V for each token
-
-    // Perform QKV projection
-    for (uint32_t i = 0; i < qkv_size; i++) {
-        fp_t val = b_qkv[i];
-        for (uint32_t j = 0; j < n_embd; j++) {
-            val += input[offset_input + j] * w_qkv[j * qkv_size + i];
-        }
-        output[offset_output + i] = val;
-    }
-}
-
 __global__ void layer_normalization_kernel(
         fp_t* input,
         fp_t* gamma,
@@ -115,6 +82,39 @@ __global__ void layer_normalization_kernel(
     for (uint32_t i = 0; i < n_embd; i++) {
         fp_t normalized = (input[offset_input + i] - mean) * inv_std;
         input[offset_input + i] = gamma[i] * normalized + beta[i];
+    }
+}
+
+__global__ void qkv_projection_kernel(
+        fp_t* input,
+        fp_t* output,
+        fp_t* w_qkv,
+        fp_t* b_qkv,
+        uint32_t batch_size,
+        uint32_t seq_length,
+        uint32_t n_embd) {
+    // Calculate thread ID
+    uint32_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Check bounds
+    if (idx_batch >= batch_size ||
+        idx_seq   >= seq_length) {
+        return;
+    }
+
+    // Get the starting index for the current token
+    uint64_t offset_input  = ((uint64_t) idx_batch * seq_length + idx_seq) * n_embd;
+    uint64_t offset_output = ((uint64_t) idx_batch * seq_length + idx_seq) * (3 * n_embd);
+    uint32_t qkv_size = 3 * n_embd; // Size of Q, K, V for each token
+
+    // Perform QKV projection
+    for (uint32_t i = 0; i < qkv_size; i++) {
+        fp_t val = b_qkv[i];
+        for (uint32_t j = 0; j < n_embd; j++) {
+            val += input[offset_input + j] * w_qkv[j * qkv_size + i];
+        }
+        output[offset_output + i] = val;
     }
 }
 
