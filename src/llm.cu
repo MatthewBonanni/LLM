@@ -28,8 +28,7 @@ LLM::LLM(const std::string& model_path) :
         max_out_length(50),
         temperature(0.7f),
         n_top_predictions(200),
-        last_batch_size(0),
-        last_seq_length(0),
+        batch_size(1),
         d_token_ids(nullptr),
         d_hidden_states(nullptr),
         d_residual(nullptr),
@@ -127,33 +126,46 @@ void LLM::load_model(std::string model_path) {
     copy_params_host_to_device();
 }
 
-void LLM::apply_embeddings(id_t* d_token_ids, fp_t* d_embeddings, uint32_t batch_size, uint32_t seq_length) {
+void LLM::allocate_temp_buffers() {
+    // Allocate temporary buffers
+    CHECK_CUDA(cudaMalloc(&d_token_ids,     batch_size * n_ctx * sizeof(id_t)));
+    CHECK_CUDA(cudaMalloc(&d_hidden_states, batch_size * n_ctx * n_embd * sizeof(fp_t)));
+    CHECK_CUDA(cudaMalloc(&d_residual,      batch_size * n_ctx * n_embd * sizeof(fp_t)));
+    CHECK_CUDA(cudaMalloc(&d_temp,          batch_size * n_ctx * n_embd * sizeof(fp_t)));
+    CHECK_CUDA(cudaMalloc(&d_logits,        batch_size * n_vocab * sizeof(fp_t)));
+}
+
+void LLM::free_temp_buffers() {
+    clean_up_memory({d_token_ids, d_hidden_states, d_residual, d_temp, d_logits});
+}
+
+void LLM::apply_embeddings(id_t* d_token_ids, fp_t* d_embeddings) {
     // Each thread handles one token (i_batch, i_sequence, :)
     // in the token_ids (batch, sequence, embedding)
     dim3 block_size(32, 32, 1);
     dim3 grid_size((batch_size + block_size.x - 1) / block_size.x,
-                   (seq_length + block_size.y - 1) / block_size.y,
+                   (n_ctx      + block_size.y - 1) / block_size.y,
                    1);
     embedding_kernel<<<grid_size, block_size>>>(
         d_token_ids, d_wte_0, d_wpe_0, d_embeddings,
-        batch_size, seq_length, n_embd);
+        batch_size, n_ctx, n_embd);
     CHECK_CUDA(cudaGetLastError());
 }
 
-void LLM::apply_final_layer_norm(fp_t* d_hidden_states, uint32_t batch_size, uint32_t seq_length) {
+void LLM::apply_final_layer_norm(fp_t* d_hidden_states) {
     // Each thread handles one token (i_batch, i_sequence, :)
     // in the hidden states (batch, sequence, embedding)
     dim3 block_size(32, 32, 1);
     dim3 grid_size((batch_size + block_size.x - 1) / block_size.x,
-                   (seq_length + block_size.y - 1) / block_size.y,
+                   (n_ctx      + block_size.y - 1) / block_size.y,
                    1);
     layer_normalization_kernel<<<grid_size, block_size>>>(
         d_hidden_states, d_ln_f_g_0, d_ln_f_b_0,
-        batch_size, seq_length, n_embd);
+        batch_size, n_ctx, n_embd);
     CHECK_CUDA(cudaGetLastError());
 }
 
-void LLM::apply_lm_head(fp_t* d_hidden_state, fp_t* d_logits, uint32_t batch_size, uint32_t seq_length) {
+void LLM::apply_lm_head(fp_t* d_hidden_state, fp_t* d_logits) {
     // GPT-2 uses wte as the lm_head
     // Each thread handles one element (i_batch, i_vocab)
     // in the logits (batch, vocab)
@@ -163,7 +175,7 @@ void LLM::apply_lm_head(fp_t* d_hidden_state, fp_t* d_logits, uint32_t batch_siz
                    1);
     lm_head_kernel<<<grid_size, block_size>>>(
         d_hidden_state, d_logits, d_wte_0, nullptr,
-        batch_size, seq_length, n_vocab, n_embd);
+        batch_size, n_ctx, n_vocab, n_embd);
     CHECK_CUDA(cudaGetLastError());
 }
 
@@ -178,6 +190,9 @@ void LLM::copy_params_host_to_device() {
 }
 
 void LLM::run_interactive() {
+    std::cout << "Allocating temporary buffers..." << std::endl;
+    allocate_temp_buffers();
+
     std::cout << "LLM Running Mode. Use CTRL-C to quit.\n";
 
     while (true) {
@@ -187,33 +202,36 @@ void LLM::run_interactive() {
         std::getline(std::cin, input);
 
         // Tokenize input
-        std::vector<id_t> h_token_ids = tokenizer.tokenize(input);
+        std::vector<id_t> token_ids = tokenizer.tokenize(input);
 
         // Print token info
         std::cout << "Token IDs: ";
-        for (auto id : h_token_ids) {
+        for (auto id : token_ids) {
             std::cout << id << " ";
         }
-        std::cout << "\nToken count: " << h_token_ids.size() << std::endl;
+        std::cout << "\nToken count: " << token_ids.size() << std::endl;
 
         // If empty input, continue
-        if (h_token_ids.empty()) {
+        if (token_ids.empty()) {
             std::cout << "Empty input, please try again.\n";
             continue;
         }
 
         // If input is too long, truncate
-        if (h_token_ids.size() > n_ctx) {
-            h_token_ids.resize(n_ctx);
+        if (token_ids.size() > n_ctx) {
+            token_ids.resize(n_ctx);
             std::cout << "WARNING: Input too long, truncating to " << n_ctx << " tokens." << std::endl;
         }
+
+        // Create padded input and fill
+        std::vector<id_t> token_ids_padded(batch_size * n_ctx, tokenizer.eos_token_id());
+        std::copy(token_ids.begin(), token_ids.end(), token_ids_padded.end() - token_ids.size());
 
         // Generate text
         // TODO: Give prior conversation as context
         std::cout << "Generated: ";
         std::vector<id_t> generated_ids;
-        uint32_t seq_length = h_token_ids.size();
-        generate_text_recursive(h_token_ids, generated_ids, 1, seq_length);
+        generate_text_recursive(token_ids_padded, generated_ids);
 
         // Print generated tokens
         for (auto id : generated_ids) {
@@ -222,16 +240,15 @@ void LLM::run_interactive() {
         }
         std::cout << std::endl;
     }
+
+    free_temp_buffers();
 }
 
 void LLM::tokenize(const std::vector<std::string>& input_texts,
                    std::vector<id_t>& token_ids,
-                   uint32_t& batch_size,
-                   uint32_t& seq_length) {
+                   uint32_t& corpus_size) {
     // Tokenize inputs
-    std::vector<std::vector<id_t>> token_ids_batches;
-    seq_length = 0;
-
+    std::vector<std::vector<id_t>> token_ids_seqs;
     std::cout << "Tokenizing input texts..." << std::endl;
     for (const auto& text : input_texts) {
         std::vector<id_t> token_ids_i = tokenizer.tokenize(text);
@@ -239,30 +256,28 @@ void LLM::tokenize(const std::vector<std::string>& input_texts,
             std::cout << "WARNING: Input too long, truncating to " << n_ctx << " tokens." << std::endl;
             token_ids_i.resize(n_ctx);
         }
-        seq_length = std::max((size_t)seq_length, token_ids_i.size());
-        token_ids_batches.push_back(std::move(token_ids_i));
+        token_ids_seqs.push_back(std::move(token_ids_i));
     }
 
-    // Pad sequences to the same length with EOS token
-    for (auto& token_ids_i : token_ids_batches) {
-        token_ids_i.resize(seq_length, tokenizer.eos_token_id());
-    }
+    // Set corpus size
+    corpus_size = token_ids_seqs.size();
 
-    batch_size = token_ids_batches.size();
-    token_ids.resize(batch_size * seq_length);
+    // Resize token_ids to hold all batches
+    // Use EOS token as padding
+    token_ids.resize(corpus_size * n_ctx);
+    std::fill(token_ids.begin(), token_ids.end(), tokenizer.eos_token_id());
 
-    // Flatten token_batches into token_ids
+    // Write token sequences into token_ids, right-aligned
     for (uint32_t i = 0; i < batch_size; ++i) {
-        std::copy(token_ids_batches[i].begin(),
-                  token_ids_batches[i].end(),
-                  token_ids.begin() + i * seq_length);
+        std::copy(token_ids_seqs[i].begin(),
+                  token_ids_seqs[i].end(),
+                  token_ids.begin() + i * n_ctx + (n_ctx - token_ids_seqs[i].size()));
     }
 }
 
 void LLM::write_token_ids(const std::string& h5_file_path,
                           const std::vector<id_t>& token_ids,
-                          uint32_t batch_size,
-                          uint32_t seq_length) {
+                          uint32_t corpus_size) {
     // Write token IDs to H5 file
     hid_t file_id = H5Fcreate(h5_file_path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
     if (file_id < 0) {
@@ -280,14 +295,14 @@ void LLM::write_token_ids(const std::string& h5_file_path,
     // Create attribute space (scalar)
     hid_t attr_space = H5Screate(H5S_SCALAR);
     
-    // Create and write batch_size attribute
-    hid_t attr_id_batch = H5Acreate(dataset_id, "batch_size", H5T_NATIVE_INT, attr_space, H5P_DEFAULT, H5P_DEFAULT);
-    H5Awrite(attr_id_batch, H5T_NATIVE_INT, &batch_size);
-    H5Aclose(attr_id_batch);
+    // Create and write corpus_size attribute
+    hid_t attr_id_corpus = H5Acreate(dataset_id, "corpus_size", H5T_NATIVE_INT, attr_space, H5P_DEFAULT, H5P_DEFAULT);
+    H5Awrite(attr_id_corpus, H5T_NATIVE_INT, &corpus_size);
+    H5Aclose(attr_id_corpus);
     
-    // Create and write seq_length attribute
-    hid_t attr_id_seq = H5Acreate(dataset_id, "seq_length", H5T_NATIVE_INT, attr_space, H5P_DEFAULT, H5P_DEFAULT);
-    H5Awrite(attr_id_seq, H5T_NATIVE_INT, &seq_length);
+    // Create and write n_ctx attribute
+    hid_t attr_id_seq = H5Acreate(dataset_id, "n_ctx", H5T_NATIVE_INT, attr_space, H5P_DEFAULT, H5P_DEFAULT);
+    H5Awrite(attr_id_seq, H5T_NATIVE_INT, &n_ctx);
     H5Aclose(attr_id_seq);
     
     // Close resources
@@ -299,8 +314,7 @@ void LLM::write_token_ids(const std::string& h5_file_path,
 
 void LLM::load_token_ids(const std::string& h5_file_path,
                          std::vector<id_t>& token_ids,
-                         uint32_t& batch_size,
-                         uint32_t& seq_length) {
+                         uint32_t& corpus_size) {
     // Load token IDs from H5 file
     hid_t file_id = H5Fopen(h5_file_path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
     if (file_id < 0) {
@@ -325,19 +339,21 @@ void LLM::load_token_ids(const std::string& h5_file_path,
     // Read token IDs data
     H5Dread(dataset_id, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, token_ids.data());
     
-    // Read batch_size attribute
-    int32_t batch_size_attr;
-    hid_t attr_id_batch = H5Aopen(dataset_id, "batch_size", H5P_DEFAULT);
-    H5Aread(attr_id_batch, H5T_NATIVE_INT, &batch_size_attr);
-    H5Aclose(attr_id_batch);
-    batch_size = batch_size_attr;
+    // Read corpus_size attribute
+    int32_t corpus_size_attr;
+    hid_t attr_id_corpus = H5Aopen(dataset_id, "corpus_size", H5P_DEFAULT);
+    H5Aread(attr_id_corpus, H5T_NATIVE_INT, &corpus_size_attr);
+    H5Aclose(attr_id_corpus);
+    corpus_size = corpus_size_attr;
 
-    // Read seq_length attribute
-    int32_t seq_length_attr;
-    hid_t attr_id_seq = H5Aopen(dataset_id, "seq_length", H5P_DEFAULT);
-    H5Aread(attr_id_seq, H5T_NATIVE_INT, &seq_length_attr);
+    // Read n_ctx attribute
+    int32_t n_ctx_attr;
+    hid_t attr_id_seq = H5Aopen(dataset_id, "n_ctx", H5P_DEFAULT);
+    H5Aread(attr_id_seq, H5T_NATIVE_INT, &n_ctx_attr);
     H5Aclose(attr_id_seq);
-    seq_length = seq_length_attr;
+    if (n_ctx_attr != n_ctx) {
+        throw std::runtime_error("Error: n_ctx attribute does not match the expected value");
+    }
 
     // Close resources
     H5Sclose(dataspace_id);
@@ -347,91 +363,87 @@ void LLM::load_token_ids(const std::string& h5_file_path,
 
 void LLM::tokenize_write_and_run_inference(const std::vector<std::string>& input_texts) {
     // Tokenize input
-    uint32_t batch_size, seq_length;
+    uint32_t corpus_size;
     std::vector<id_t> token_ids;
-    tokenize(input_texts, token_ids, batch_size, seq_length);
+    tokenize(input_texts, token_ids, corpus_size);
 
     // Write token IDs to H5 file
     std::string h5_file_path = "token_ids.h5";
-    write_token_ids(h5_file_path, token_ids, batch_size, seq_length);
+    write_token_ids(h5_file_path, token_ids, corpus_size);
 
     // Run inference
-    run_inference(token_ids, batch_size, seq_length);
+    run_inference(token_ids, corpus_size);
 }
 
 void LLM::load_tokens_and_run_inference(const std::string& h5_file_path) {
     // Load token IDs from H5 file
-    uint32_t batch_size, seq_length;
+    uint32_t corpus_size;
     std::vector<id_t> token_ids;
-    load_token_ids(h5_file_path, token_ids, batch_size, seq_length);
+    load_token_ids(h5_file_path, token_ids, corpus_size);
 
     // Run inference
-    run_inference(token_ids, batch_size, seq_length);
+    run_inference(token_ids, corpus_size);
 }
 
 void LLM::run_inference(const std::vector<id_t>& token_ids,
-                        uint32_t batch_size,
-                        uint32_t seq_length) {
-    std::cout << "Running inference on " << batch_size
-              << " input sequences of max length " << seq_length
-              << "..." << std::endl;
+                        uint32_t corpus_size) {
+    std::vector<id_t> token_ids_adjusted = token_ids;
+    batch_size = 1000;
+    if (corpus_size > batch_size) {
+        std::cout << "WARNING: corpus_size > batch_size, only running on the first batch." << std::endl;
+        token_ids_adjusted.resize(batch_size * n_ctx);
+    } else {
+        batch_size = corpus_size;
+    }
+
+    std::cout << "Allocating temporary buffers..." << std::endl;
+    allocate_temp_buffers();
+
+    std::cout << "Running inference on 1 batch of " << batch_size
+              << " input sequences..." << std::endl;
     std::vector<id_t> generated_ids;
-    generate_text_recursive(token_ids, generated_ids, batch_size, seq_length);
+    generate_text_recursive(token_ids_adjusted, generated_ids);
+
+    std::cout << "Done. Freeing temporary buffers..." << std::endl;
+    free_temp_buffers();
 }
 
 
 void LLM::forward_pass(const std::vector<id_t>& token_ids,
-                       std::vector<fp_t>& logits,
-                       uint32_t batch_size,
-                       uint32_t seq_length) {
-    uint64_t token_count = batch_size * seq_length;
-    if (token_ids.size() != token_count) {
-        throw std::runtime_error("Error: token_ids.size() does not match batch_size * seq_length");
-    }
-    
-    // Allocate device memory if necessary
-    if (last_batch_size != batch_size ||
-        last_seq_length != seq_length) {
-        // Free old device memory (or do nothing if it is unallocated)
-        clean_up_memory({d_token_ids, d_hidden_states, d_residual, d_temp, d_logits});
-
-        // Allocate new device memory
-        CHECK_CUDA(cudaMalloc(&d_token_ids, token_count * sizeof(id_t)));
-        CHECK_CUDA(cudaMalloc(&d_hidden_states, token_count * n_embd * sizeof(fp_t)));
-        CHECK_CUDA(cudaMalloc(&d_residual, token_count * n_embd * sizeof(fp_t)));
-        CHECK_CUDA(cudaMalloc(&d_temp, token_count * n_embd * sizeof(fp_t)));
-        CHECK_CUDA(cudaMalloc(&d_logits, batch_size * n_vocab * sizeof(fp_t)));
-
-        last_batch_size = batch_size;
-        last_seq_length = seq_length;
-    }
-
+                       std::vector<fp_t>& logits) {
     // Token IDs
-    CHECK_CUDA(cudaMemcpy(d_token_ids, token_ids.data(), token_count * sizeof(id_t), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(
+        d_token_ids,
+        token_ids.data(),
+        (uint64_t)batch_size * n_ctx * sizeof(id_t),
+        cudaMemcpyHostToDevice));
 
     // Embeddings
-    apply_embeddings(d_token_ids, d_hidden_states, batch_size, seq_length);
+    apply_embeddings(d_token_ids, d_hidden_states);
 
     // Process through transformer layers
     for (uint32_t i = 0; i < n_layer; i++) {
-        layers[i]->apply(d_hidden_states, d_residual, d_temp, batch_size, seq_length);
+        layers[i]->apply(d_hidden_states, d_residual, d_temp, batch_size, n_ctx);
     }
 
     // Apply final layer norm
-    apply_final_layer_norm(d_hidden_states, batch_size, seq_length);
+    apply_final_layer_norm(d_hidden_states);
 
     // Get logits for the last token position
-    apply_lm_head(d_hidden_states, d_logits, batch_size, seq_length);
+    apply_lm_head(d_hidden_states, d_logits);
 
     // Synchronize device
     CHECK_CUDA(cudaDeviceSynchronize());
 
     // Copy logits to host
-    CHECK_CUDA(cudaMemcpy(logits.data(), d_logits, (uint64_t)batch_size * n_vocab * sizeof(fp_t), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(
+        logits.data(),
+        d_logits,
+        (uint64_t)batch_size * n_vocab * sizeof(fp_t),
+        cudaMemcpyDeviceToHost));
 }
 
-std::vector<std::pair<fp_t, id_t>> LLM::get_top_predictions(const std::vector<fp_t>& logits,
-                                                            uint32_t batch_size) {
+std::vector<std::pair<fp_t, id_t>> LLM::get_top_predictions(const std::vector<fp_t>& logits) {
     std::vector<std::pair<fp_t, id_t>> probs;
     probs.reserve(batch_size * n_vocab);
 
@@ -465,8 +477,7 @@ std::vector<std::pair<fp_t, id_t>> LLM::get_top_predictions(const std::vector<fp
     return probs;
 }
 
-std::vector<id_t> LLM::sample_tokens(const std::vector<std::pair<fp_t, id_t>>& probabilities,
-                                     uint32_t batch_size) {
+std::vector<id_t> LLM::sample_tokens(const std::vector<std::pair<fp_t, id_t>>& probabilities) {
     // Sample based on adjusted probabilities
     static std::random_device rd;
     static std::mt19937 gen(rd());
@@ -489,9 +500,7 @@ std::vector<id_t> LLM::sample_tokens(const std::vector<std::pair<fp_t, id_t>>& p
 
 void LLM::append_new_tokens(std::vector<id_t>& generated_ids,
                             std::vector<id_t>& context_ids,
-                            const std::vector<id_t>& new_ids,
-                            uint32_t batch_size,
-                            uint32_t& seq_length) {
+                            const std::vector<id_t>& new_ids) {
     // Handle generated tokens (accumulating generated tokens)
     // Expand generated tokens
     uint32_t seq_length_generated = generated_ids.size() / batch_size;
@@ -507,39 +516,19 @@ void LLM::append_new_tokens(std::vector<id_t>& generated_ids,
         generated_ids[(int64_t)i * (seq_length_generated + 1) + seq_length_generated] = new_ids[i];
     }
 
-    // Handle context tokens (moving window)
-    if (seq_length < n_ctx) {
-        // Expand context tokens
-        context_ids.resize(batch_size * (seq_length + 1));
-
-        // Copy old context tokens and add new token at the end
-        // Work backwards to avoid overwriting
-        for (int32_t i = batch_size - 1; i >= 0; i--) {
-            for (int32_t j = seq_length - 1; j >= 0; j--) {
-                context_ids[(int64_t)i * (seq_length + 1) + j] =
-                    context_ids[(int64_t)i * seq_length + j];
-            }
-            context_ids[(int64_t)i * (seq_length + 1) + seq_length] = new_ids[i];
+    // Shift context tokens to the left and add new token at the end
+    for (int32_t i = 0; i < batch_size; i++) {
+        for (int32_t j = 0; j < n_ctx - 1; j++) {
+            context_ids[(int64_t)i * n_ctx + j] =
+                context_ids[(int64_t)i * n_ctx + j + 1];
         }
-
-        seq_length++;
-    } else {
-        // Shift context tokens to the left and add new token at the end
-        for (int32_t i = 0; i < batch_size; i++) {
-            for (int32_t j = 0; j < seq_length - 1; j++) {
-                context_ids[(int64_t)i * seq_length + j] =
-                    context_ids[(int64_t)i * seq_length + j + 1];
-            }
-            context_ids[(int64_t)i * seq_length + seq_length - 1] = new_ids[i];
-        }
+        context_ids[(int64_t)i * n_ctx + n_ctx - 1] = new_ids[i];
     }
 }
 
-bool LLM::all_eos(const std::vector<id_t>& ids,
-                  uint32_t batch_size,
-                  uint32_t seq_length) {
+bool LLM::all_eos(const std::vector<id_t>& ids) {
     for (uint32_t i = 0; i < batch_size; i++) {
-        if (ids[(uint64_t)i * seq_length + seq_length - 1] != tokenizer.eos_token_id()) {
+        if (ids[(uint64_t)i * n_ctx + n_ctx - 1] != tokenizer.eos_token_id()) {
             return false;
         }
     }
@@ -547,25 +536,32 @@ bool LLM::all_eos(const std::vector<id_t>& ids,
 }
 
 void LLM::generate_text_recursive(const std::vector<id_t>& input_ids,
-                                  std::vector<id_t>& generated_ids,
-                                  uint32_t batch_size,
-                                  uint32_t& seq_length) {
-    std::flush(std::cout);
+                                  std::vector<id_t>& generated_ids) {
+    if (input_ids.size() != batch_size * n_ctx) {
+        throw std::runtime_error("Error: input_ids size does not match batch_size * n_ctx");
+    }
     std::vector<id_t> context_ids = input_ids;
     std::vector<fp_t> logits(batch_size * n_vocab);
+
+    // Initialize context_ids with input_ids
+    for (uint32_t i = 0; i < batch_size; i++) {
+        for (uint32_t j = 0; j < n_ctx; j++) {
+            context_ids[(uint64_t)i * n_ctx + j] = input_ids[(uint64_t)i * n_ctx + j];
+        }
+    }
     
     for (uint32_t gen_idx = 0; gen_idx < max_out_length; gen_idx++) {
         // Forward pass for the current sequence
-        forward_pass(context_ids, logits, batch_size, seq_length);
+        forward_pass(context_ids, logits);
         
         // Get predictions
-        std::vector<std::pair<fp_t, id_t>> probabilities = get_top_predictions(logits, batch_size);
+        std::vector<std::pair<fp_t, id_t>> probabilities = get_top_predictions(logits);
         
         // Sample next token
-        std::vector<id_t> next_ids = sample_tokens(probabilities, batch_size);
+        std::vector<id_t> next_ids = sample_tokens(probabilities);
         
         // Add to generated sequence
-        append_new_tokens(generated_ids, context_ids, next_ids, batch_size, seq_length);
+        append_new_tokens(generated_ids, context_ids, next_ids);
         
         // Print the token if batch size is 1
         if (batch_size == 1) {
@@ -577,7 +573,7 @@ void LLM::generate_text_recursive(const std::vector<id_t>& input_ids,
         }
 
         // Check for EOS token
-        if (all_eos(next_ids, batch_size, seq_length)) {
+        if (all_eos(next_ids)) {
             break;
         }
     }
