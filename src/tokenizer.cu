@@ -137,15 +137,15 @@ std::vector<std::string> Tokenizer::apply_bpe(const std::vector<std::string>& ch
 
     while (tokens.size() > 1) {
         std::pair<std::string, std::string> best_pair;
-        uint64_t best_pair_rank = 0;
-        uint64_t best_pair_index = 0;
+        int64_t best_pair_rank = -1;
+        int64_t best_pair_index = -1;
 
         // Iterate through all pairs of tokens
         for (uint64_t i = 0; i < tokens.size() - 1; i++) {
             std::pair<std::string, std::string> pair = {tokens[i], tokens[i + 1]};
             auto it = std::find(bpe_merges.begin(), bpe_merges.end(), pair);
             if (it != bpe_merges.end()) {
-                uint64_t rank = std::distance(bpe_merges.begin(), it);
+                int64_t rank = std::distance(bpe_merges.begin(), it);
                 if (rank < best_pair_rank || best_pair_rank == -1) {
                     best_pair = pair;
                     best_pair_rank = rank;

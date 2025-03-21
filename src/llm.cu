@@ -27,7 +27,14 @@ LLM::LLM(const std::string& model_path) :
         d_ln_f_g_0(nullptr),
         max_out_length(50),
         temperature(0.7f),
-        n_top_predictions(200) {
+        n_top_predictions(200),
+        last_batch_size(0),
+        last_seq_length(0),
+        d_token_ids(nullptr),
+        d_hidden_states(nullptr),
+        d_residual(nullptr),
+        d_temp(nullptr),
+        d_logits(nullptr) {
     load_hparams(model_path);
     load_model(model_path);
 
@@ -373,40 +380,31 @@ void LLM::run_inference(const std::vector<id_t>& token_ids,
 }
 
 
-std::vector<fp_t> LLM::forward_pass(const std::vector<id_t>& token_ids,
-                                    uint64_t batch_size,
-                                    uint64_t seq_length) {
-    // Allocate device memory for token IDs and embeddings
-    id_t* d_token_ids = nullptr;
-    fp_t* d_hidden_states = nullptr;
-    fp_t* d_residual = nullptr;
-    fp_t* d_temp = nullptr;
-    fp_t* d_logits = nullptr;
-    std::vector<fp_t> h_logits(batch_size * n_vocab);
-
+void LLM::forward_pass(const std::vector<id_t>& token_ids,
+                       std::vector<fp_t>& logits,
+                       uint64_t batch_size,
+                       uint64_t seq_length) {
     uint64_t token_count = batch_size * seq_length;
     if (token_ids.size() != token_count) {
         throw std::runtime_error("Error: token_ids.size() does not match batch_size * seq_length");
     }
+    
+    // Allocate device memory if necessary
+    if (last_batch_size != batch_size ||
+        last_seq_length != seq_length) {
+        // Free old device memory (or do nothing if it is unallocated)
+        clean_up_memory({d_token_ids, d_hidden_states, d_residual, d_temp, d_logits});
 
-    // Allocate device memory
-    std::cout << "HERE: ALLOCATING DEVICE MEMORY" << std::endl;
-    uint64_t free_memory, total_memory;
-    cudaMemGetInfo(&free_memory, &total_memory);
-    std::cout << "Total GPU memory: " << total_memory / (1024 * 1024) << " MB" << std::endl;
-    std::cout << "Free GPU memory: " << free_memory / (1024 * 1024) << " MB" << std::endl;
-    uint64_t required_memory = token_count * sizeof(id_t) +
-                               token_count * n_embd * sizeof(fp_t) * 3 +
-                               batch_size * n_vocab * sizeof(fp_t);
-    std::cout << "Required GPU memory: " << required_memory / (1024 * 1024) << " MB" << std::endl;
-    if (required_memory > free_memory) {
-        throw std::runtime_error("Not enough GPU memory available for allocation.");
+        // Allocate new device memory
+        CHECK_CUDA(cudaMalloc(&d_token_ids, token_count * sizeof(id_t)));
+        CHECK_CUDA(cudaMalloc(&d_hidden_states, token_count * n_embd * sizeof(fp_t)));
+        CHECK_CUDA(cudaMalloc(&d_residual, token_count * n_embd * sizeof(fp_t)));
+        CHECK_CUDA(cudaMalloc(&d_temp, token_count * n_embd * sizeof(fp_t)));
+        CHECK_CUDA(cudaMalloc(&d_logits, batch_size * n_vocab * sizeof(fp_t)));
+
+        last_batch_size = batch_size;
+        last_seq_length = seq_length;
     }
-    CHECK_CUDA(cudaMalloc(&d_token_ids,     token_count * sizeof(id_t)));
-    CHECK_CUDA(cudaMalloc(&d_hidden_states, token_count * n_embd * sizeof(fp_t)));
-    CHECK_CUDA(cudaMalloc(&d_residual,      token_count * n_embd * sizeof(fp_t)));
-    CHECK_CUDA(cudaMalloc(&d_temp,          token_count * n_embd * sizeof(fp_t)));
-    CHECK_CUDA(cudaMalloc(&d_logits,        batch_size * n_vocab * sizeof(fp_t)));
 
     // Token IDs
     CHECK_CUDA(cudaMemcpy(d_token_ids, token_ids.data(), token_count * sizeof(id_t), cudaMemcpyHostToDevice));
@@ -429,12 +427,7 @@ std::vector<fp_t> LLM::forward_pass(const std::vector<id_t>& token_ids,
     CHECK_CUDA(cudaDeviceSynchronize());
 
     // Copy logits to host
-    CHECK_CUDA(cudaMemcpy(h_logits.data(), d_logits, batch_size * n_vocab * sizeof(fp_t), cudaMemcpyDeviceToHost));
-
-    // Clean up resources
-    clean_up_memory({d_token_ids, d_hidden_states, d_residual, d_logits});
-
-    return h_logits;
+    CHECK_CUDA(cudaMemcpy(logits.data(), d_logits, batch_size * n_vocab * sizeof(fp_t), cudaMemcpyDeviceToHost));
 }
 
 std::vector<std::pair<fp_t, id_t>> LLM::get_top_predictions(const std::vector<fp_t>& logits,
@@ -556,10 +549,11 @@ void LLM::generate_text_recursive(const std::vector<id_t>& input_ids,
                                   uint64_t& seq_length) {
     std::flush(std::cout);
     std::vector<id_t> context_ids = input_ids;
+    std::vector<fp_t> logits(batch_size * n_vocab);
     
     for (uint64_t gen_idx = 0; gen_idx < max_out_length; gen_idx++) {
         // Forward pass for the current sequence
-        std::vector<fp_t> logits = forward_pass(context_ids, batch_size, seq_length);
+        forward_pass(context_ids, logits, batch_size, seq_length);
         
         // Get predictions
         std::vector<std::pair<fp_t, id_t>> probabilities = get_top_predictions(logits, batch_size);
@@ -591,5 +585,6 @@ void LLM::clean_up_memory(const std::vector<void*>& buffers) {
         if (buffer != nullptr) {
             CHECK_CUDA(cudaFree(buffer));
         }
+        buffer = nullptr;
     }
 }
