@@ -12,7 +12,7 @@ class Tokenizer {
         Tokenizer(const std::string& model_path);
         ~Tokenizer();
 
-        uint64_t n_vocab() const;
+        uint32_t n_vocab() const;
 
         std::vector<id_t> tokenize(const std::string& text);
         std::string detokenize(const std::vector<id_t>& tokens);

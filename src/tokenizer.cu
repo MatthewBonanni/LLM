@@ -77,7 +77,7 @@ void Tokenizer::load_bpe_merges(const std::string& model_path) {
     file.close();
 }
 
-uint64_t Tokenizer::n_vocab() const {
+uint32_t Tokenizer::n_vocab() const {
     return token_to_id.size();
 }
 

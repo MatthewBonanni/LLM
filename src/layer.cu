@@ -8,7 +8,7 @@
 #include "io.cuh"
 #include "kernels.cuh"
 
-Layer::Layer(uint64_t n_embd, uint64_t n_head) : 
+Layer::Layer(uint32_t n_embd, uint32_t n_head) : 
         n_embd(n_embd),
         n_head(n_head),
         d_attn_c_attn_w_0(nullptr),
@@ -72,18 +72,24 @@ void Layer::apply(
         fp_t* d_hidden_states,
         fp_t* d_residual,
         fp_t* d_temp,
-        uint64_t batch_size,
-        uint64_t seq_length) {
+        uint32_t batch_size,
+        uint32_t seq_length) {
     // Dimensions
     dim3 grid_size;
     dim3 block_size;
 
     // Allocate temporary buffers
     fp_t* d_qkv = nullptr;
-    CHECK_CUDA(cudaMalloc(&d_qkv, batch_size * seq_length * 3 * n_embd * sizeof(fp_t)));
+    CHECK_CUDA(cudaMalloc(
+        &d_qkv,
+        (uint64_t)batch_size * seq_length * 3 * n_embd * sizeof(fp_t)));
     
     // Step 1: Save input for residual connection
-    CHECK_CUDA(cudaMemcpy(d_residual, d_hidden_states, batch_size * seq_length * n_embd * sizeof(fp_t), cudaMemcpyDeviceToDevice));
+    CHECK_CUDA(cudaMemcpy(
+        d_residual,
+        d_hidden_states,
+        (uint64_t)batch_size * seq_length * n_embd * sizeof(fp_t),
+        cudaMemcpyDeviceToDevice));
     
     // Step 2: First layer normalization
     // Each thread handles one token (i_batch, i_sequence, :)
@@ -159,7 +165,11 @@ void Layer::apply(
     CHECK_CUDA(cudaGetLastError());
 
     // Step 5: Save output for residual connection
-    CHECK_CUDA(cudaMemcpy(d_residual, d_hidden_states, seq_length * n_embd * sizeof(fp_t), cudaMemcpyDeviceToDevice));
+    CHECK_CUDA(cudaMemcpy(
+        d_residual,
+        d_hidden_states,
+        (uint64_t)seq_length * n_embd * sizeof(fp_t),
+        cudaMemcpyDeviceToDevice));
 
     // Step 6: Second layer normalization
     // Each thread handles one token (i_batch, i_sequence, :)

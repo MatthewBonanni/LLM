@@ -11,22 +11,22 @@
 
 class Layer {
     public:
-        Layer(uint64_t n_embd, uint64_t n_head);
+        Layer(uint32_t n_embd, uint32_t n_head);
         ~Layer();
         void apply(
             fp_t* d_hidden_states,
             fp_t* d_residual,
             fp_t* d_temp,
-            uint64_t batch_size,
-            uint64_t seq_length);
+            uint32_t batch_size,
+            uint32_t seq_length);
         void load_from_hdf5(hid_t file_id, const std::string& layer_path);
         void copy_host_to_device();
         void copy_device_to_host();
 
     private:
         // Layer parameters
-        uint64_t n_embd;
-        uint64_t n_head;
+        uint32_t n_embd;
+        uint32_t n_head;
 
         // Attention
         std::vector<fp_t> h_attn_c_attn_w_0;
