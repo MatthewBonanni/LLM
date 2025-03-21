@@ -12,3 +12,6 @@
         exit(EXIT_FAILURE); \
     } \
 }
+
+typedef uint32_t id_t;
+typedef float fp_t;

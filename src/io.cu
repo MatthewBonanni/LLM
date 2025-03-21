@@ -6,9 +6,11 @@
 
 #include <hdf5_hl.h>
 
-void read_dataset(hid_t file_id, const std::string& path, std::vector<float>& data) {
+#include "utils.cuh"
+
+void read_dataset(hid_t file_id, const std::string& path, std::vector<fp_t>& data) {
     hsize_t dims[H5S_MAX_RANK];
-    int ndims;
+    int32_t ndims;
     if (H5LTget_dataset_ndims(file_id, path.c_str(), &ndims) < 0) {
         throw std::runtime_error("Error getting dataset dimensions for: " + path);
     }
@@ -18,7 +20,7 @@ void read_dataset(hid_t file_id, const std::string& path, std::vector<float>& da
     }
 
     hsize_t total_size = 1;
-    for (int i = 0; i < ndims; ++i) {
+    for (int32_t i = 0; i < ndims; ++i) {
         total_size *= dims[i];
     }
 
@@ -27,7 +29,7 @@ void read_dataset(hid_t file_id, const std::string& path, std::vector<float>& da
                                  " does not match expected size " + std::to_string(data.size()));
     }
 
-    std::vector<float> temp_data(total_size);
+    std::vector<fp_t> temp_data(total_size);
     if (H5LTread_dataset_float(file_id, path.c_str(), temp_data.data()) < 0) {
         throw std::runtime_error("Error reading dataset: " + path);
     }
@@ -37,14 +39,14 @@ void read_dataset(hid_t file_id, const std::string& path, std::vector<float>& da
     for (hsize_t i = 0; i < total_size; ++i) {
         hsize_t flat_index = 0;
         hsize_t stride = 1;
-        for (int j = ndims - 1; j >= 0; --j) {
+        for (int32_t j = ndims - 1; j >= 0; --j) {
             flat_index += indices[j] * stride;
             stride *= dims[j];
         }
         data[i] = temp_data[flat_index];
 
         // Increment indices
-        for (int j = ndims - 1; j >= 0; --j) {
+        for (int32_t j = ndims - 1; j >= 0; --j) {
             if (++indices[j] < dims[j]) {
                 break;
             }

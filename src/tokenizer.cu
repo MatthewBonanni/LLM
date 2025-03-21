@@ -7,6 +7,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "utils.cuh"
+
 Tokenizer::Tokenizer(const std::string& model_path) {
     load_pattern_string(model_path);
     load_vocab(model_path);
@@ -75,13 +77,13 @@ void Tokenizer::load_bpe_merges(const std::string& model_path) {
     file.close();
 }
 
-int Tokenizer::n_vocab() const {
+uint64_t Tokenizer::n_vocab() const {
     return token_to_id.size();
 }
 
-std::vector<int> Tokenizer::tokenize(const std::string& text) {
+std::vector<id_t> Tokenizer::tokenize(const std::string& text) {
     std::vector<std::string> tokens;
-    std::vector<int> token_ids;
+    std::vector<id_t> token_ids;
 
     auto words_begin = std::sregex_iterator(text.begin(),
                                             text.end(),
@@ -116,9 +118,9 @@ std::vector<int> Tokenizer::tokenize(const std::string& text) {
     return token_ids;
 }
 
-std::string Tokenizer::detokenize(const std::vector<int>& tokens) {
+std::string Tokenizer::detokenize(const std::vector<id_t>& tokens) {
     std::string text;
-    for (int token_id : tokens) {
+    for (auto token_id : tokens) {
         if (id_to_token.find(token_id) != id_to_token.end()) {
             text += id_to_token[token_id];
         } else {
@@ -135,15 +137,15 @@ std::vector<std::string> Tokenizer::apply_bpe(const std::vector<std::string>& ch
 
     while (tokens.size() > 1) {
         std::pair<std::string, std::string> best_pair;
-        int best_pair_rank = -1;
-        int best_pair_index = -1;
+        uint64_t best_pair_rank = 0;
+        uint64_t best_pair_index = 0;
 
         // Iterate through all pairs of tokens
-        for (size_t i = 0; i < tokens.size() - 1; i++) {
+        for (uint64_t i = 0; i < tokens.size() - 1; i++) {
             std::pair<std::string, std::string> pair = {tokens[i], tokens[i + 1]};
             auto it = std::find(bpe_merges.begin(), bpe_merges.end(), pair);
             if (it != bpe_merges.end()) {
-                int rank = std::distance(bpe_merges.begin(), it);
+                uint64_t rank = std::distance(bpe_merges.begin(), it);
                 if (rank < best_pair_rank || best_pair_rank == -1) {
                     best_pair = pair;
                     best_pair_rank = rank;
@@ -190,6 +192,6 @@ std::vector<std::string> Tokenizer::split_utf8_chars(const std::string& input) {
     return chars;
 }
 
-int Tokenizer::eos_token_id() const {
+id_t Tokenizer::eos_token_id() const {
     return token_to_id.at("<|endoftext|>");
 }

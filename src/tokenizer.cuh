@@ -5,16 +5,18 @@
 #include <unordered_map>
 #include <vector>
 
+#include "utils.cuh"
+
 class Tokenizer {
     public:
         Tokenizer(const std::string& model_path);
         ~Tokenizer();
 
-        int n_vocab() const;
+        uint64_t n_vocab() const;
 
-        std::vector<int> tokenize(const std::string& text);
-        std::string detokenize(const std::vector<int>& tokens);
-        int eos_token_id() const;
+        std::vector<id_t> tokenize(const std::string& text);
+        std::string detokenize(const std::vector<id_t>& tokens);
+        id_t eos_token_id() const;
 
     private:
         void load_pattern_string(const std::string& model_path);
@@ -27,7 +29,7 @@ class Tokenizer {
 
         std::string pattern_string;
         std::regex pattern;
-        std::unordered_map<std::string, int> token_to_id;
-        std::unordered_map<int, std::string> id_to_token;
+        std::unordered_map<std::string, id_t> token_to_id;
+        std::unordered_map<id_t, std::string> id_to_token;
         std::vector<std::pair<std::string, std::string>> bpe_merges;
 };
