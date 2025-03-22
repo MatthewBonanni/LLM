@@ -19,7 +19,8 @@
 #include "layer.cuh"
 #include "kernels.cuh"
 
-LLM::LLM(const std::string& model_path) :
+LLM::LLM(const std::string& model_path,
+         uint32_t batch_size) :
         tokenizer(model_path),
         d_wte_0(nullptr),
         d_wpe_0(nullptr),
@@ -28,7 +29,7 @@ LLM::LLM(const std::string& model_path) :
         max_out_length(50),
         temperature(0.7f),
         n_top_predictions(200),
-        batch_size(1),
+        batch_size(batch_size),
         d_token_ids(nullptr),
         d_hidden_states(nullptr),
         d_residual(nullptr),
@@ -209,6 +210,8 @@ void LLM::copy_params_host_to_device() {
 }
 
 void LLM::run_interactive() {
+    batch_size = 1;  // Set batch size to 1 for interactive mode
+
     std::cout << "Allocating temporary buffers..." << std::endl;
     allocate_temp_buffers(n_ctx);
     for (auto& layer : layers) {
@@ -411,10 +414,9 @@ void LLM::run_inference(const std::vector<id_t>& token_ids,
                         uint32_t corpus_size,
                         uint32_t seq_length) {
     std::vector<id_t> token_ids_adjusted = token_ids;
-    batch_size = 1000;
     if (corpus_size > batch_size) {
         std::cout << "WARNING: corpus_size > batch_size, only running on the first batch." << std::endl;
-        token_ids_adjusted.resize(batch_size * n_ctx);
+        token_ids_adjusted.resize(batch_size * seq_length);
     } else {
         batch_size = corpus_size;
     }
@@ -426,7 +428,8 @@ void LLM::run_inference(const std::vector<id_t>& token_ids,
     }
 
     std::cout << "Running inference on 1 batch of " << batch_size
-              << " input sequences..." << std::endl;
+              << " input sequences of length " << seq_length
+              << "..." << std::endl;
     std::vector<id_t> generated_ids;
     generate_text_recursive(token_ids_adjusted, generated_ids, seq_length);
 

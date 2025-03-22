@@ -13,7 +13,7 @@
 
 class LLM {
     public:
-        LLM(const std::string& model_path);
+        LLM(const std::string& model_path, uint32_t batch_size);
         ~LLM();
 
         void print();
