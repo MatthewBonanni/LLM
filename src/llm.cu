@@ -277,8 +277,8 @@ void LLM::tokenize(const std::vector<std::string>& input_texts,
             std::cout << "WARNING: Input too long, truncating to " << n_ctx << " tokens." << std::endl;
             token_ids_i.resize(n_ctx);
         }
-        token_ids_seqs.push_back(std::move(token_ids_i));
         seq_length = std::max(seq_length, (uint32_t)token_ids_i.size());
+        token_ids_seqs.push_back(std::move(token_ids_i));
     }
 
     // Set corpus size
