@@ -11,20 +11,24 @@
 
 class Layer {
     public:
-        Layer(uint32_t n_embd, uint32_t n_head);
+        Layer(uint32_t n_ctx, uint32_t n_embd, uint32_t n_head);
         ~Layer();
+        void allocate_kv_cache(uint32_t batch_size);
         void apply(
             fp_t* d_hidden_states,
             fp_t* d_residual,
             fp_t* d_temp,
             uint32_t batch_size,
-            uint32_t seq_length);
+            uint32_t seq_length,
+            uint32_t seq_offset);
         void load_from_hdf5(hid_t file_id, const std::string& layer_path);
         void copy_host_to_device();
         void copy_device_to_host();
+        void shift_kv_cache(uint32_t seq_length);
 
     private:
         // Layer parameters
+        uint32_t n_ctx;
         uint32_t n_embd;
         uint32_t n_head;
 
@@ -57,4 +61,8 @@ class Layer {
         fp_t* d_mlp_c_fc_b_0;
         fp_t* d_mlp_c_proj_w_0;
         fp_t* d_mlp_c_proj_b_0;
+
+        // KV cache
+        fp_t* d_kv_cache;
+        uint32_t kv_cache_size;
 };

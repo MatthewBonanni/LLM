@@ -15,6 +15,7 @@ __global__ void embedding_kernel(
         fp_t* embeddings,
         uint32_t batch_size,
         uint32_t seq_length,
+        uint32_t seq_offset,
         uint32_t n_embd) {
     // Calculate thread ID
     uint32_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
@@ -32,7 +33,7 @@ __global__ void embedding_kernel(
     // Calculate offsets
     uint64_t offset_out = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
     uint64_t offset_wte = (uint64_t)token_id * n_embd;
-    uint64_t offset_wpe = (uint64_t)idx_seq * n_embd;
+    uint64_t offset_wpe = ((uint64_t)idx_seq + seq_offset) * n_embd;
 
     // Perform embedding lookup
     for (uint32_t i = 0; i < n_embd; i++) {
@@ -86,12 +87,14 @@ __global__ void layer_normalization_kernel(
 }
 
 __global__ void qkv_projection_kernel(
-        fp_t* input,
-        fp_t* output,
+        fp_t* hidden_states,
+        fp_t* q,
+        fp_t* kv,
         fp_t* w_qkv,
         fp_t* b_qkv,
         uint32_t batch_size,
         uint32_t seq_length,
+        uint32_t seq_offset,
         uint32_t n_embd) {
     // Calculate thread ID
     uint32_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
@@ -104,25 +107,36 @@ __global__ void qkv_projection_kernel(
     }
 
     // Get the starting index for the current token
-    uint64_t offset_input  = ((uint64_t) idx_batch * seq_length + idx_seq) * n_embd;
-    uint64_t offset_output = ((uint64_t) idx_batch * seq_length + idx_seq) * (3 * n_embd);
+    uint64_t offset_hidden = ((uint64_t) idx_batch * seq_length + idx_seq) * n_embd;
+    uint64_t offset_q = ((uint64_t) idx_batch * seq_length + idx_seq             ) * (    n_embd);
+    uint64_t offset_k = ((uint64_t) idx_batch * (seq_length + seq_offset) + idx_seq + seq_offset) * (2 * n_embd);
+    uint64_t offset_v = ((uint64_t) idx_batch * (seq_length + seq_offset) + idx_seq + seq_offset) * (2 * n_embd) + n_embd;
     uint32_t qkv_size = 3 * n_embd; // Size of Q, K, V for each token
 
-    // Perform QKV projection
-    for (uint32_t i = 0; i < qkv_size; i++) {
-        fp_t val = b_qkv[i];
+    // Perform Q, K, V projection
+    for (uint32_t i = 0; i < n_embd; i++) {
+        fp_t val_q = b_qkv[             i];
+        fp_t val_k = b_qkv[    n_embd + i];
+        fp_t val_v = b_qkv[2 * n_embd + i];
         for (uint32_t j = 0; j < n_embd; j++) {
-            val += input[offset_input + j] * w_qkv[j * qkv_size + i];
+            fp_t hidden = hidden_states[offset_hidden + j];
+            val_q += hidden * w_qkv[j * qkv_size +              i];
+            val_k += hidden * w_qkv[j * qkv_size +     n_embd + i];
+            val_v += hidden * w_qkv[j * qkv_size + 2 * n_embd + i];
         }
-        output[offset_output + i] = val;
+        q[offset_q + i] = val_q;
+        kv[offset_k + i] = val_k;
+        kv[offset_v + i] = val_v;
     }
 }
 
 __global__ void multi_head_attention_kernel(
-        fp_t* qkv,
+        fp_t* q,
+        fp_t* kv,
         fp_t* output,
         uint32_t batch_size,
         uint32_t seq_length,
+        uint32_t seq_offset,
         uint32_t n_head,
         uint32_t n_embd) {
     // Calculate thread ID
@@ -137,7 +151,7 @@ __global__ void multi_head_attention_kernel(
 
     // Calculate dimensions
     uint32_t d_k = n_embd / n_head; // Dimension of each head
-    uint32_t qkv_size = 3 * n_embd; // Size of Q, K, V for each token
+    uint32_t kv_size = 2 * n_embd; // Size of Q, K, V for each token
 
     // Scores register
     fp_t scores[SEQ_LENGTH_MAX];
@@ -148,7 +162,7 @@ __global__ void multi_head_attention_kernel(
     for (uint32_t i_head = 0; i_head < n_head; i_head++) {
         // Calculate attention scores between current token and all other tokens
         fp_t max_val = -INFINITY;
-        for (uint32_t j_token = 0; j_token < seq_length; j_token++) {
+        for (uint32_t j_token = 0; j_token < (seq_length + seq_offset); j_token++) {
             // Causal masking: only attend to positions j_token <= i_token
             if (j_token <= idx_seq) {
                 // Compute dot product
@@ -156,8 +170,15 @@ __global__ void multi_head_attention_kernel(
                 for (uint32_t d = 0; d < d_k; d++) {
                     // Q values for token idx_seq, head i_head
                     // K values for token j_token, head i_head
-                    dot += qkv[idx_batch * seq_length * qkv_size + idx_seq * qkv_size + i_head * d_k + d] *
-                           qkv[idx_batch * seq_length * qkv_size + j_token * qkv_size + 1 * n_embd + i_head * d_k + d];
+                    dot += q[idx_batch * seq_length * n_embd +
+                             idx_seq * n_embd +
+                             i_head * d_k +
+                             d] *
+                           kv[idx_batch * (seq_length + seq_offset) * kv_size +
+                              j_token * kv_size +
+                              0 * n_embd +
+                              i_head * d_k +
+                              d];
                 }
                 scores[j_token] = dot * scale;
                 max_val = fmaxf(max_val, scores[j_token]);
@@ -183,13 +204,20 @@ __global__ void multi_head_attention_kernel(
         // Calculate weighted sum of values
         for (uint32_t d = 0; d < d_k; d++) {
             fp_t weighted_sum = 0.0f;
-            for (uint32_t j_token = 0; j_token < seq_length; j_token++) {
+            for (uint32_t j_token = 0; j_token < (seq_length + seq_offset); j_token++) {
                 // Get V values for token j_token, head i_head
                 weighted_sum += scores[j_token] *
-                                qkv[idx_batch * seq_length * qkv_size + j_token * qkv_size + 2 * n_embd + i_head * d_k + d];
+                                kv[idx_batch * (seq_length + seq_offset) * kv_size +
+                                   j_token * kv_size +
+                                   1 * n_embd +
+                                   i_head * d_k +
+                                   d];
             }
             // Use input as a temporary buffer to store head outputs
-            output[idx_batch * seq_length * n_embd + idx_seq * n_embd + i_head * d_k + d] = weighted_sum;
+            output[idx_batch * seq_length * n_embd +
+                   idx_seq * n_embd +
+                   i_head * d_k +
+                   d] = weighted_sum;
         }
     }
 }
@@ -273,7 +301,7 @@ __global__ void mlp_kernel(
 
     // Intermediate register
     uint32_t intermediate_size = 4 * n_embd;
-    fp_t intermediate[INTERMEDIATE_SIZE_MAX];
+    fp_t intermediate[INTERMEDIATE_SIZE];
 
     // Get the starting index for the current token
     uint64_t offset_input = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;

@@ -4,7 +4,7 @@
 
 #include "utils.cuh"
 
-#define INTERMEDIATE_SIZE_MAX 3072
+#define INTERMEDIATE_SIZE 3072
 #define SEQ_LENGTH_MAX 1024
 
 __device__ __host__ fp_t gelu(fp_t x);
@@ -16,15 +16,18 @@ __global__ void embedding_kernel(
     fp_t* embeddings,
     uint32_t batch_size,
     uint32_t seq_length,
+    uint32_t seq_offset,
     uint32_t n_embd);
 
 __global__ void qkv_projection_kernel(
-    fp_t* input,
-    fp_t* output,
+    fp_t* hidden_states,
+    fp_t* q,
+    fp_t* kv,
     fp_t* w_qkv,
     fp_t* b_qkv,
     uint32_t batch_size,
     uint32_t seq_length,
+    uint32_t seq_offset,
     uint32_t n_embd);
 
 __global__ void layer_normalization_kernel(
@@ -36,10 +39,12 @@ __global__ void layer_normalization_kernel(
     uint32_t n_embd);
 
 __global__ void multi_head_attention_kernel(
-    fp_t* qkv,
+    fp_t* q,
+    fp_t* kv,
     fp_t* output,
     uint32_t batch_size,
     uint32_t seq_length,
+    uint32_t seq_offset,
     uint32_t n_head,
     uint32_t n_embd);
 
@@ -80,3 +85,13 @@ __global__ void lm_head_kernel(
     uint32_t seq_length,
     uint32_t n_vocab,
     uint32_t n_embd);
+
+__global__ void append_kv_cache_kernel(
+    fp_t* kv_cache,
+    fp_t* new_kv,
+    uint32_t batch_size,
+    uint32_t seq_length,
+    uint32_t n_ctx,
+    uint32_t n_head,
+    uint32_t n_embd,
+    uint32_t cache_size);

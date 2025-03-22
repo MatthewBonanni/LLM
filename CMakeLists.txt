@@ -37,6 +37,7 @@ add_executable(llm
     src/tokenizer.cu
     src/layer.cu
     src/io.cu
+    src/utils.cu
 )
 
 # Include directories
