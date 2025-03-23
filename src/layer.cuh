@@ -33,34 +33,34 @@ class Layer {
             uint32_t seq_length);
         
         void launch_qkv_projection(
-            fp_t* d_hidden_states,
+            const fp_t* d_hidden_states,
             fp_t* d_q,
             uint32_t batch_size,
             uint32_t seq_length,
             uint32_t seq_offset);
         
         void launch_multi_head_attention(
-            fp_t* d_q,
+            const fp_t* d_q,
             fp_t* d_output,
             uint32_t batch_size,
             uint32_t seq_length,
             uint32_t seq_offset);
         
         void launch_final_projection(
-            fp_t* d_input,
+            const fp_t* d_input,
             fp_t* d_output,
             uint32_t batch_size,
             uint32_t seq_length);
         
         void launch_add_residual(
-            fp_t* d_input,
-            fp_t* d_residual,
+            const fp_t* d_input,
+            const fp_t* d_residual,
             fp_t* d_output,
             uint32_t batch_size,
             uint32_t seq_length);
         
         void launch_mlp(
-            fp_t* d_input,
+            const fp_t* d_input,
             fp_t* d_output,
             uint32_t batch_size,
             uint32_t seq_length);

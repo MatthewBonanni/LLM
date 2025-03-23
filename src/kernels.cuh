@@ -34,21 +34,29 @@ __global__ void layer_normalization_kernel(
     uint32_t seq_length,
     uint32_t n_embd);
 
-__global__ void qkv_projection_kernel(
-    fp_t* hidden_states,
-    fp_t* q,
-    half* kv,
-    fp_t* w_qkv,
-    fp_t* b_qkv,
+__global__ void q_projection_kernel(
+    const fp_t* __restrict__ hidden_states,
+    fp_t* __restrict__ q,
+    const fp_t* __restrict__ w_q,
+    const fp_t* __restrict__ b_q,
+    uint32_t batch_size,
+    uint32_t seq_length,
+    uint32_t n_embd);
+
+__global__ void kv_projection_kernel(
+    const fp_t* __restrict__ hidden_states,
+    half* __restrict__ kv,
+    const fp_t* __restrict__ w_kv,
+    const fp_t* __restrict__ b_kv,
     uint32_t batch_size,
     uint32_t seq_length,
     uint32_t seq_offset,
     uint32_t n_embd);
 
 __global__ void multi_head_attention_kernel(
-    fp_t* q,
-    half* kv,
-    fp_t* output,
+    const fp_t* __restrict__ q,
+    const half* __restrict__ kv,
+    fp_t* __restrict__ output,
     uint32_t batch_size,
     uint32_t seq_length,
     uint32_t seq_offset,
@@ -56,38 +64,38 @@ __global__ void multi_head_attention_kernel(
     uint32_t n_embd);
 
 __global__ void final_projection_kernel(
-    fp_t* input,
-    fp_t* output,
-    fp_t* w_proj,
-    fp_t* b_proj,
+    const fp_t* __restrict__ input,
+    fp_t* __restrict__ output,
+    const fp_t* __restrict__ w_proj,
+    const fp_t* __restrict__ b_proj,
     uint32_t batch_size,
     uint32_t seq_length,
     uint32_t n_embd);
 
 __global__ void add_residual_kernel(
-    fp_t* input,
-    fp_t* residual,
-    fp_t* output,
+    const fp_t* __restrict__ input,
+    const fp_t* __restrict__ residual,
+    fp_t* __restrict__ output,
     uint32_t batch_size,
     uint32_t seq_length,
     uint32_t n_embd);
 
 __global__ void mlp_kernel(
-    fp_t* input,
-    fp_t* output,
-    fp_t* w_fc,
-    fp_t* b_fc,
-    fp_t* w_proj,
-    fp_t* b_proj,
+    const fp_t* __restrict__ input,
+    fp_t* __restrict__ output,
+    const fp_t* __restrict__ w_fc,
+    const fp_t* __restrict__ b_fc,
+    const fp_t* __restrict__ w_proj,
+    const fp_t* __restrict__ b_proj,
     uint32_t batch_size,
     uint32_t seq_length,
     uint32_t n_embd);
 
 __global__ void lm_head_kernel(
-    fp_t* hidden_state,
-    fp_t* logits,
-    fp_t* weights,
-    fp_t* biases,
+    const fp_t* __restrict__ hidden_state,
+    fp_t* __restrict__ logits,
+    const fp_t* __restrict__ weights,
+    const fp_t* __restrict__ biases,
     uint32_t batch_size,
     uint32_t seq_length,
     uint32_t n_vocab,

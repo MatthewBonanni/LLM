@@ -96,27 +96,39 @@ void Layer::launch_layer_normalization(
 }
 
 void Layer::launch_qkv_projection(
-        fp_t* d_hidden_states,
+        const fp_t* d_hidden_states,
         fp_t* d_q,
         uint32_t batch_size,
         uint32_t seq_length,
         uint32_t seq_offset) {
     // Each block handles one token (i_batch, i_sequence, :)
     // in the hidden states (batch, sequence, embedding)
-    dim3 block_size(32, 16, 1);
-    dim3 grid_size((n_embd     + block_size.x - 1) / block_size.x,
-                   (seq_length + block_size.y - 1) / block_size.y,
-                   batch_size);
-    size_t shared_mem_size = (WMMA_M * n_embd + 3 * WMMA_M * WMMA_K) * sizeof(half);
-    qkv_projection_kernel<<<grid_size, block_size, shared_mem_size>>>(
-        d_hidden_states, d_q, d_kv_cache,
-        d_attn_c_attn_w_0, d_attn_c_attn_b_0,
-        batch_size, seq_length, seq_offset, n_embd);
+    dim3 block_size_q(32, 32, 1);
+    dim3 grid_size_q(1,
+                     (seq_length + block_size_q.y - 1) / block_size_q.y,
+                     batch_size);
+    size_t shared_mem_size_q = (WMMA_M * n_embd + WMMA_M * WMMA_K) * sizeof(half);
+    fp_t* w_q = d_attn_c_attn_w_0;
+    fp_t* b_q = d_attn_c_attn_b_0;
+    q_projection_kernel<<<grid_size_q, block_size_q, shared_mem_size_q>>>(
+        d_hidden_states, d_q, w_q, b_q,
+        batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
+    
+    dim3 block_size_kv(32, 16, 1);
+    dim3 grid_size_kv(1,
+                      (seq_length + block_size_kv.y - 1) / block_size_kv.y,
+                      batch_size);
+    size_t shared_mem_size_kv = (WMMA_M * n_embd + 2 * WMMA_M * WMMA_K) * sizeof(half);
+    fp_t* w_kv = d_attn_c_attn_w_0 + n_embd * n_embd;
+    fp_t* b_kv = d_attn_c_attn_b_0 + n_embd;
+    kv_projection_kernel<<<grid_size_kv, block_size_kv, shared_mem_size_kv>>>(
+        d_hidden_states, d_kv_cache, w_kv, b_kv,
+        batch_size, seq_length, seq_offset, n_embd);
 }
 
 void Layer::launch_multi_head_attention(
-        fp_t* d_q,
+        const fp_t* d_q,
         fp_t* d_output,
         uint32_t batch_size,
         uint32_t seq_length,
@@ -134,7 +146,7 @@ void Layer::launch_multi_head_attention(
 }
 
 void Layer::launch_final_projection(
-        fp_t* d_input,
+        const fp_t* d_input,
         fp_t* d_output,
         uint32_t batch_size,
         uint32_t seq_length) {
@@ -152,8 +164,8 @@ void Layer::launch_final_projection(
 }
 
 void Layer::launch_add_residual(
-        fp_t* d_input,
-        fp_t* d_residual,
+        const fp_t* d_input,
+        const fp_t* d_residual,
         fp_t* d_output,
         uint32_t batch_size,
         uint32_t seq_length) {
@@ -170,7 +182,7 @@ void Layer::launch_add_residual(
 }
 
 void Layer::launch_mlp(
-        fp_t* d_input,
+        const fp_t* d_input,
         fp_t* d_output,
         uint32_t batch_size,
         uint32_t seq_length) {
