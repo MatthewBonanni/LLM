@@ -81,6 +81,45 @@ void Layer::allocate_kv_cache(uint32_t batch_size) {
     CHECK_CUDA(cudaMalloc(&d_kv_cache, (uint64_t)batch_size * n_ctx * 2 * n_embd * sizeof(half)));
 }
 
+void Layer::launch_layer_normalization(
+        fp_t* d_input,
+        const fp_t* d_gamma,
+        const fp_t* d_beta,
+        uint32_t batch_size,
+        uint32_t seq_length) {
+    // Each block handles one token (i_batch, i_sequence, :)
+    // in the hidden states (batch, sequence, embedding)
+    dim3 grid_size(batch_size, seq_length, 1);
+    dim3 block_size(256, 1, 1);
+    layer_normalization_kernel<256, 8><<<grid_size, block_size>>>(
+        d_input, d_gamma, d_beta,
+        batch_size, seq_length, n_embd);
+    CHECK_CUDA(cudaGetLastError());
+}
+
+void Layer::launch_qkv_projection(
+        fp_t* d_hidden_states,
+        fp_t* d_q,
+        half* d_kv,
+        fp_t* d_w_qkv,
+        fp_t* d_b_qkv,
+        uint32_t batch_size,
+        uint32_t seq_length,
+        uint32_t seq_offset) {
+    // Each block handles one token (i_batch, i_sequence, :)
+    // in the hidden states (batch, sequence, embedding)
+    dim3 block_size(32, 16, 1);
+    dim3 grid_size((n_embd     + block_size.x - 1) / block_size.x,
+                   (seq_length + block_size.y - 1) / block_size.y,
+                   batch_size);
+    size_t shared_mem_size = (WMMA_M * n_embd + 3 * WMMA_M * WMMA_K) * sizeof(half);
+    qkv_projection_kernel<<<grid_size, block_size, shared_mem_size>>>(
+        d_hidden_states, d_q, d_kv,
+        d_w_qkv, d_b_qkv,
+        batch_size, seq_length, seq_offset, n_embd);
+    CHECK_CUDA(cudaGetLastError());
+}
+
 void Layer::apply(
         fp_t* d_hidden_states,
         fp_t* d_residual,
@@ -104,33 +143,19 @@ void Layer::apply(
         cudaMemcpyDeviceToDevice));
     
     // Step 2: First layer normalization
-    // Each block handles one token (i_batch, i_sequence, :)
-    // in the hidden states (batch, sequence, embedding)
-    block_size.x = 256;
-    block_size.y = 1;
-    block_size.z = 1;
-    grid_size.x = batch_size;
-    grid_size.y = seq_length;
-    grid_size.z = 1;
-    layer_normalization_kernel<256, 8><<<grid_size, block_size>>>(
-        d_hidden_states, d_ln_1_g_0, d_ln_1_b_0,
-        batch_size, seq_length, n_embd);
-    CHECK_CUDA(cudaGetLastError());
+    launch_layer_normalization(
+        d_hidden_states,
+        d_ln_1_g_0,
+        d_ln_1_b_0,
+        batch_size,
+        seq_length);
 
     // Step 3: Multi-head attention
     // Step 3.1: QKV projection
-    block_size.x = 32;
-    block_size.y = 16;
-    block_size.z = 1;
-    grid_size.x = (n_embd     + block_size.x - 1) / block_size.x;
-    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
-    grid_size.z = batch_size;
-    size_t shared_mem_size = (WMMA_M * n_embd + 3 * WMMA_M * WMMA_K) * sizeof(half);
-    qkv_projection_kernel<<<grid_size, block_size, shared_mem_size>>>(
+    launch_qkv_projection(
         d_hidden_states, d_q, d_kv_cache,
-        d_attn_c_attn_w_0, d_attn_c_attn_b_0, 
-        batch_size, seq_length, seq_offset, n_embd);
-    CHECK_CUDA(cudaGetLastError());
+        d_attn_c_attn_w_0, d_attn_c_attn_b_0,
+        batch_size, seq_length, seq_offset);
 
     // Step 3.2: Multi-head attention
     // Each thread handles one token (i_batch, i_sequence, :)
