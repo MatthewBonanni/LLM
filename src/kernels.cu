@@ -1,6 +1,7 @@
 #include "kernels.cuh"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include "utils.cuh"
 
@@ -18,26 +19,48 @@ __global__ void embedding_kernel(
         uint32_t seq_offset,
         uint32_t n_embd) {
     // Calculate thread ID
-    uint32_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
-
-    // Check bounds
-    if (idx_batch >= batch_size ||
-        idx_seq   >= seq_length) {
-        return;
-    }
+    uint32_t idx_batch = blockIdx.x;
+    uint32_t idx_seq = blockIdx.y;
+    uint32_t tidx = threadIdx.x;
+    const uint32_t block_size = blockDim.x;
     
-    // Get token ID for current position
-    id_t token_id = token_ids[idx_batch * seq_length + idx_seq];
-
-    // Calculate offsets
-    uint64_t offset_out = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
-    uint64_t offset_wte = (uint64_t)token_id * n_embd;
-    uint64_t offset_wpe = ((uint64_t)idx_seq + seq_offset) * n_embd;
-
-    // Perform embedding lookup
-    for (uint32_t i = 0; i < n_embd; i++) {
-        embeddings[offset_out + i] = wte[offset_wte + i] + wpe[offset_wpe + i];
+    // Shared memory for token ID (one per block)
+    __shared__ id_t token_id;
+    if (tidx == 0) {
+        token_id = token_ids[idx_batch * seq_length + idx_seq];
+    }
+    __syncthreads();
+    
+    // Calculate base offsets
+    uint64_t out_offset = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
+    uint64_t wte_offset = (uint64_t)token_id * n_embd;
+    uint64_t wpe_offset = ((uint64_t)idx_seq + seq_offset) * n_embd;
+    
+    // Iterate over the embedding dimension in chunks of 8
+    for (uint32_t i = tidx * 8; i < n_embd; i += block_size * 8) {
+        // Load first 4 elements
+        float4 wte_vec1 = *reinterpret_cast<float4*>(&wte[wte_offset + i]);
+        float4 wpe_vec1 = *reinterpret_cast<float4*>(&wpe[wpe_offset + i]);
+        
+        // Load next 4 elements
+        float4 wte_vec2 = *reinterpret_cast<float4*>(&wte[wte_offset + i + 4]);
+        float4 wpe_vec2 = *reinterpret_cast<float4*>(&wpe[wpe_offset + i + 4]);
+        
+        // Store first 4 elements
+        *reinterpret_cast<float4*>(&embeddings[out_offset + i]) = make_float4(
+            wte_vec1.x + wpe_vec1.x,
+            wte_vec1.y + wpe_vec1.y,
+            wte_vec1.z + wpe_vec1.z,
+            wte_vec1.w + wpe_vec1.w
+        );
+        
+        // Store next 4 elements
+        *reinterpret_cast<float4*>(&embeddings[out_offset + i + 4]) = make_float4(
+            wte_vec2.x + wpe_vec2.x,
+            wte_vec2.y + wpe_vec2.y,
+            wte_vec2.z + wpe_vec2.z,
+            wte_vec2.w + wpe_vec2.w
+        );
     }
 }
 
@@ -89,7 +112,7 @@ __global__ void layer_normalization_kernel(
 __global__ void qkv_projection_kernel(
         fp_t* hidden_states,
         fp_t* q,
-        fp_t* kv,
+        half* kv,
         fp_t* w_qkv,
         fp_t* b_qkv,
         uint32_t batch_size,
@@ -116,13 +139,13 @@ __global__ void qkv_projection_kernel(
     // Perform Q, K, V projection
     for (uint32_t i = 0; i < n_embd; i++) {
         fp_t val_q = b_qkv[             i];
-        fp_t val_k = b_qkv[    n_embd + i];
-        fp_t val_v = b_qkv[2 * n_embd + i];
+        half val_k = __float2half(b_qkv[    n_embd + i]);
+        half val_v = __float2half(b_qkv[2 * n_embd + i]);
         for (uint32_t j = 0; j < n_embd; j++) {
             fp_t hidden = hidden_states[offset_hidden + j];
-            val_q += hidden * w_qkv[j * qkv_size +              i];
-            val_k += hidden * w_qkv[j * qkv_size +     n_embd + i];
-            val_v += hidden * w_qkv[j * qkv_size + 2 * n_embd + i];
+            val_q += hidden * w_qkv[j * qkv_size + i];
+            val_k += __float2half(hidden) * __float2half(w_qkv[j * qkv_size +     n_embd + i]);
+            val_v += __float2half(hidden) * __float2half(w_qkv[j * qkv_size + 2 * n_embd + i]);
         }
         q[offset_q + i] = val_q;
         kv[offset_k + i] = val_k;
@@ -132,7 +155,7 @@ __global__ void qkv_projection_kernel(
 
 __global__ void multi_head_attention_kernel(
         fp_t* q,
-        fp_t* kv,
+        half* kv,
         fp_t* output,
         uint32_t batch_size,
         uint32_t seq_length,
@@ -174,11 +197,11 @@ __global__ void multi_head_attention_kernel(
                              idx_seq * n_embd +
                              i_head * d_k +
                              d] *
-                           kv[idx_batch * (seq_length + seq_offset) * kv_size +
-                              j_token * kv_size +
-                              0 * n_embd +
-                              i_head * d_k +
-                              d];
+                           __half2float(kv[idx_batch * (seq_length + seq_offset) * kv_size +
+                                           j_token * kv_size +
+                                           0 * n_embd +
+                                           i_head * d_k +
+                                           d]);
                 }
                 scores[j_token] = dot * scale;
                 max_val = fmaxf(max_val, scores[j_token]);
@@ -207,11 +230,11 @@ __global__ void multi_head_attention_kernel(
             for (uint32_t j_token = 0; j_token < (seq_length + seq_offset); j_token++) {
                 // Get V values for token j_token, head i_head
                 weighted_sum += scores[j_token] *
-                                kv[idx_batch * (seq_length + seq_offset) * kv_size +
-                                   j_token * kv_size +
-                                   1 * n_embd +
-                                   i_head * d_k +
-                                   d];
+                                __half2float(kv[idx_batch * (seq_length + seq_offset) * kv_size +
+                                                j_token * kv_size +
+                                                1 * n_embd +
+                                                i_head * d_k +
+                                                d]);
             }
             // Use input as a temporary buffer to store head outputs
             output[idx_batch * seq_length * n_embd +

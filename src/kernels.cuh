@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include "utils.cuh"
 
@@ -22,7 +23,7 @@ __global__ void embedding_kernel(
 __global__ void qkv_projection_kernel(
     fp_t* hidden_states,
     fp_t* q,
-    fp_t* kv,
+    half* kv,
     fp_t* w_qkv,
     fp_t* b_qkv,
     uint32_t batch_size,
@@ -40,7 +41,7 @@ __global__ void layer_normalization_kernel(
 
 __global__ void multi_head_attention_kernel(
     fp_t* q,
-    fp_t* kv,
+    half* kv,
     fp_t* output,
     uint32_t batch_size,
     uint32_t seq_length,
@@ -85,13 +86,3 @@ __global__ void lm_head_kernel(
     uint32_t seq_length,
     uint32_t n_vocab,
     uint32_t n_embd);
-
-__global__ void append_kv_cache_kernel(
-    fp_t* kv_cache,
-    fp_t* new_kv,
-    uint32_t batch_size,
-    uint32_t seq_length,
-    uint32_t n_ctx,
-    uint32_t n_head,
-    uint32_t n_embd,
-    uint32_t cache_size);

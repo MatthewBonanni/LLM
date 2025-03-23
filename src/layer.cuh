@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <string>
 #include <vector>
@@ -63,6 +64,6 @@ class Layer {
         fp_t* d_mlp_c_proj_b_0;
 
         // KV cache
-        fp_t* d_kv_cache;
+        half* d_kv_cache;
         uint32_t kv_cache_size;
 };

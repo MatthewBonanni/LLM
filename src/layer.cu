@@ -1,6 +1,7 @@
 #include "layer.cuh"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <stdexcept>
 #include <vector>
@@ -77,7 +78,7 @@ Layer::~Layer() {
 }
 
 void Layer::allocate_kv_cache(uint32_t batch_size) {
-    CHECK_CUDA(cudaMalloc(&d_kv_cache, (uint64_t)batch_size * n_ctx * 2 * n_embd * sizeof(fp_t)));
+    CHECK_CUDA(cudaMalloc(&d_kv_cache, (uint64_t)batch_size * n_ctx * 2 * n_embd * sizeof(half)));
 }
 
 void Layer::apply(

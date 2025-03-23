@@ -151,14 +151,10 @@ void LLM::apply_embeddings(id_t* d_token_ids,
                            fp_t* d_embeddings,
                            uint32_t seq_length,
                            uint32_t seq_offset) {
-    // Each thread handles one token (i_batch, i_sequence, :)
+    // Each block handles one token (i_batch, i_sequence, :)
     // in the token_ids (batch, sequence, embedding)
-    dim3 block_size(std::min(batch_size, (uint32_t)32),
-                    std::min(seq_length, (uint32_t)32),
-                    1);
-    dim3 grid_size((batch_size + block_size.x - 1) / block_size.x,
-                   (seq_length + block_size.y - 1) / block_size.y,
-                   1);
+    dim3 grid_size(batch_size, seq_length);
+    dim3 block_size(128);
     embedding_kernel<<<grid_size, block_size>>>(
         d_token_ids, d_wte_0, d_wpe_0, d_embeddings,
         batch_size, seq_length, seq_offset, n_embd);
