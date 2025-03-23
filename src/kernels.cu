@@ -2,8 +2,11 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 
 #include "utils.cuh"
+
+using namespace nvcuda;
 
 __device__ __host__ fp_t gelu(fp_t x) {
     return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
@@ -183,46 +186,124 @@ template __global__ void layer_normalization_kernel<256, 8>(
         uint32_t n_embd);
 
 __global__ void qkv_projection_kernel(
-        fp_t* hidden_states,
-        fp_t* q,
+        float* hidden_states,
+        float* q,
         half* kv,
-        fp_t* w_qkv,
-        fp_t* b_qkv,
+        float* w_qkv,
+        float* b_qkv,
         uint32_t batch_size,
         uint32_t seq_length,
         uint32_t seq_offset,
         uint32_t n_embd) {
-    // Calculate thread ID
-    uint32_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
+    // Calculate batch and sequence indices
+    uint32_t batch_idx = blockIdx.z;
+    uint32_t seq_idx = blockIdx.y * blockDim.y + threadIdx.y;
 
     // Check bounds
-    if (idx_batch >= batch_size ||
-        idx_seq   >= seq_length) {
+    if (batch_idx >= batch_size ||
+        seq_idx   >= seq_length) {
         return;
     }
+    
+    // Calculate tile indices
+    uint32_t tile_x = threadIdx.x;
+    uint32_t tile_y = threadIdx.y % WMMA_M;
 
-    // Get the starting index for the current token
-    uint64_t offset_hidden = ((uint64_t) idx_batch * seq_length + idx_seq) * n_embd;
-    uint64_t offset_q = ((uint64_t) idx_batch * seq_length + idx_seq) * n_embd;
-    uint64_t offset_k = ((uint64_t) idx_batch * (seq_length + seq_offset) + idx_seq + seq_offset) * (2 * n_embd);
-    uint64_t offset_v = ((uint64_t) idx_batch * (seq_length + seq_offset) + idx_seq + seq_offset) * (2 * n_embd) + n_embd;
-    uint32_t qkv_size = 3 * n_embd; // Size of Q, K, V for each token
-
-    // Perform Q, K, V projection
-    for (uint32_t i = 0; i < n_embd; i++) {
-        fp_t val_q = b_qkv[             i];
-        half val_k = __float2half(b_qkv[    n_embd + i]);
-        half val_v = __float2half(b_qkv[2 * n_embd + i]);
-        for (uint32_t j = 0; j < n_embd; j++) {
-            fp_t hidden = hidden_states[offset_hidden + j];
-            val_q += hidden * w_qkv[j * qkv_size + i];
-            val_k += __float2half(hidden) * __float2half(w_qkv[j * qkv_size +     n_embd + i]);
-            val_v += __float2half(hidden) * __float2half(w_qkv[j * qkv_size + 2 * n_embd + i]);
+    // Calculate memory offsets
+    uint64_t hidden_offset = ((uint64_t)batch_idx * seq_length + seq_idx) * n_embd;
+    uint64_t q_offset = ((uint64_t)batch_idx * seq_length + seq_idx) * n_embd;
+    uint64_t kv_offset = ((uint64_t)batch_idx * (seq_length + seq_offset) + seq_idx + seq_offset) * (2 * n_embd);
+    
+    // Allocate shared memory for tiling
+    // Layout: [hidden_fragment][weights_fragment]
+    extern __shared__ half smem[];
+    half* hidden_shared  = &smem[0];
+    half* weights_shared = &smem[WMMA_M * n_embd];
+    
+    // Initialize fragments
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> hidden_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> q_weights_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> k_weights_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> v_weights_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> q_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> k_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> v_frag;
+    
+    wmma::fill_fragment(hidden_frag, 0.0f);
+    wmma::fill_fragment(q_weights_frag, 0.0f);
+    wmma::fill_fragment(k_weights_frag, 0.0f);
+    wmma::fill_fragment(v_weights_frag, 0.0f);
+    wmma::fill_fragment(q_frag, 0.0f);
+    wmma::fill_fragment(k_frag, 0.0f);
+    wmma::fill_fragment(v_frag, 0.0f);
+    
+    // Copy bias values into output arrays
+    for (uint32_t i = tile_x; i < n_embd; i += blockDim.x) {
+        q[q_offset + i] = b_qkv[i];
+        kv[kv_offset +          i] = __float2half(b_qkv[    n_embd + i]);
+        kv[kv_offset + n_embd + i] = __float2half(b_qkv[2 * n_embd + i]);
+    }
+    
+    // Synchronize threads
+    __syncthreads();
+    
+    // Process in tiles of WMMA_K
+    for (uint32_t k_idx = 0; k_idx < n_embd; k_idx += WMMA_K) {
+        // Load hidden states into shared memory
+        for (uint32_t i = tile_x; i < WMMA_K && (k_idx + i) < n_embd; i += blockDim.x) {
+            hidden_shared[tile_y * WMMA_K + i] = __float2half(hidden_states[hidden_offset + k_idx + i]);
         }
-        q[offset_q + i] = val_q;
-        kv[offset_k + i] = val_k;
-        kv[offset_v + i] = val_v;
+        
+        // Load weights into shared memory - each thread loads multiple elements
+        for (uint32_t i = tile_y; i < WMMA_M && i < n_embd; i += blockDim.y) {
+            for (uint32_t j = tile_x; j < WMMA_K && (k_idx + j) < n_embd; j += blockDim.x) {
+                // Load Q weights
+                weights_shared[i * WMMA_K + j] = 
+                    __float2half(w_qkv[(k_idx + j) * (3 * n_embd) + i]);
+                
+                // Load K weights
+                weights_shared[WMMA_M * WMMA_K + i * WMMA_K + j] = 
+                    __float2half(w_qkv[(k_idx + j) * (3 * n_embd) + n_embd + i]);
+                
+                // Load V weights
+                weights_shared[2 * WMMA_M * WMMA_K + i * WMMA_K + j] = 
+                    __float2half(w_qkv[(k_idx + j) * (3 * n_embd) + 2 * n_embd + i]);
+            }
+        }
+        
+        // Synchronize after loading data to shared memory
+        __syncthreads();
+        
+        // Load fragments
+        wmma::load_matrix_sync(hidden_frag, hidden_shared, WMMA_K);
+        wmma::load_matrix_sync(q_weights_frag, weights_shared, WMMA_K);
+        wmma::load_matrix_sync(k_weights_frag, &weights_shared[WMMA_M * WMMA_K], WMMA_K);
+        wmma::load_matrix_sync(v_weights_frag, &weights_shared[2 * WMMA_M * WMMA_K], WMMA_K);
+        
+        // Perform matrix multiplication using tensor cores
+        wmma::mma_sync(q_frag, hidden_frag, q_weights_frag, q_frag);
+        wmma::mma_sync(k_frag, hidden_frag, k_weights_frag, k_frag);
+        wmma::mma_sync(v_frag, hidden_frag, v_weights_frag, v_frag);
+        
+        // Synchronize before next iteration
+        __syncthreads();
+    }
+    
+    // Store results
+    for (uint32_t i = tile_x; i < n_embd; i += blockDim.x) {
+        uint32_t col = i % WMMA_N;
+        uint32_t row = i / WMMA_N;
+        
+        if (row < WMMA_M && col < WMMA_N) {
+            // Atomic add results to handle overlapping tiles
+            atomicAdd(&q[q_offset + i], q_frag.x[row * WMMA_N + col]);
+            
+            // Convert and store K, V to half precision
+            atomicAdd(&kv[kv_offset + i], 
+                      __float2half(k_frag.x[row * WMMA_N + col]));
+            atomicAdd(&kv[kv_offset + n_embd + i], 
+                      __float2half(v_frag.x[row * WMMA_N + col]));
+        }
     }
 }
 

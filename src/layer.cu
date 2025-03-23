@@ -119,15 +119,14 @@ void Layer::apply(
 
     // Step 3: Multi-head attention
     // Step 3.1: QKV projection
-    // Each thread handles one token (i_batch, i_sequence, :)
-    // in the QKV (batch, sequence, embedding)
-    block_size.x = std::min(batch_size, (uint32_t)32);
-    block_size.y = std::min(seq_length, (uint32_t)32);
+    block_size.x = 32;
+    block_size.y = 16;
     block_size.z = 1;
-    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
+    grid_size.x = (n_embd     + block_size.x - 1) / block_size.x;
     grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
-    grid_size.z = 1;
-    qkv_projection_kernel<<<grid_size, block_size>>>(
+    grid_size.z = batch_size;
+    size_t shared_mem_size = (WMMA_M * n_embd + 3 * WMMA_M * WMMA_K) * sizeof(half);
+    qkv_projection_kernel<<<grid_size, block_size, shared_mem_size>>>(
         d_hidden_states, d_q, d_kv_cache,
         d_attn_c_attn_w_0, d_attn_c_attn_b_0, 
         batch_size, seq_length, seq_offset, n_embd);

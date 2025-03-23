@@ -8,6 +8,9 @@
 #define WARP_SIZE 32
 #define INTERMEDIATE_SIZE 3072
 #define SEQ_LENGTH_MAX 1024
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
 
 __device__ __host__ fp_t gelu(fp_t x);
 
