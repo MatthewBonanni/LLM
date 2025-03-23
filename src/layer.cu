@@ -83,8 +83,6 @@ void Layer::allocate_kv_cache(uint32_t batch_size) {
 
 void Layer::launch_layer_normalization(
         fp_t* d_input,
-        const fp_t* d_gamma,
-        const fp_t* d_beta,
         uint32_t batch_size,
         uint32_t seq_length) {
     // Each block handles one token (i_batch, i_sequence, :)
@@ -92,7 +90,7 @@ void Layer::launch_layer_normalization(
     dim3 grid_size(batch_size, seq_length, 1);
     dim3 block_size(256, 1, 1);
     layer_normalization_kernel<256, 8><<<grid_size, block_size>>>(
-        d_input, d_gamma, d_beta,
+        d_input, d_ln_1_g_0, d_ln_1_b_0,
         batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
 }
@@ -100,9 +98,6 @@ void Layer::launch_layer_normalization(
 void Layer::launch_qkv_projection(
         fp_t* d_hidden_states,
         fp_t* d_q,
-        half* d_kv,
-        fp_t* d_w_qkv,
-        fp_t* d_b_qkv,
         uint32_t batch_size,
         uint32_t seq_length,
         uint32_t seq_offset) {
@@ -114,9 +109,82 @@ void Layer::launch_qkv_projection(
                    batch_size);
     size_t shared_mem_size = (WMMA_M * n_embd + 3 * WMMA_M * WMMA_K) * sizeof(half);
     qkv_projection_kernel<<<grid_size, block_size, shared_mem_size>>>(
-        d_hidden_states, d_q, d_kv,
-        d_w_qkv, d_b_qkv,
+        d_hidden_states, d_q, d_kv_cache,
+        d_attn_c_attn_w_0, d_attn_c_attn_b_0,
         batch_size, seq_length, seq_offset, n_embd);
+    CHECK_CUDA(cudaGetLastError());
+}
+
+void Layer::launch_multi_head_attention(
+        fp_t* d_q,
+        fp_t* d_output,
+        uint32_t batch_size,
+        uint32_t seq_length,
+        uint32_t seq_offset) {
+    // Each thread handles one token (i_batch, i_sequence, :)
+    // in the hidden states (batch, sequence, embedding)
+    dim3 block_size(32, 32, 1);
+    dim3 grid_size((batch_size + block_size.x - 1) / block_size.x,
+                   (seq_length + block_size.y - 1) / block_size.y,
+                   1);
+    multi_head_attention_kernel<<<grid_size, block_size>>>(
+        d_q, d_kv_cache, d_output,
+        batch_size, seq_length, seq_offset, n_head, n_embd);
+    CHECK_CUDA(cudaGetLastError());
+}
+
+void Layer::launch_final_projection(
+        fp_t* d_input,
+        fp_t* d_output,
+        uint32_t batch_size,
+        uint32_t seq_length) {
+    // Each thread handles one token (i_batch, i_sequence, :)
+    // in the hidden states (batch, sequence, embedding)
+    dim3 block_size(32, 32, 1);
+    dim3 grid_size((batch_size + block_size.x - 1) / block_size.x,
+                   (seq_length + block_size.y - 1) / block_size.y,
+                   1);
+    final_projection_kernel<<<grid_size, block_size>>>(
+        d_input, d_output,
+        d_attn_c_proj_w_0, d_attn_c_proj_b_0,
+        batch_size, seq_length, n_embd);
+    CHECK_CUDA(cudaGetLastError());
+}
+
+void Layer::launch_add_residual(
+        fp_t* d_input,
+        fp_t* d_residual,
+        fp_t* d_output,
+        uint32_t batch_size,
+        uint32_t seq_length) {
+    // Each thread handles one token (i_batch, i_sequence, :)
+    // in the hidden states (batch, sequence, embedding)
+    dim3 block_size(32, 32, 1);
+    dim3 grid_size((batch_size + block_size.x - 1) / block_size.x,
+                   (seq_length + block_size.y - 1) / block_size.y,
+                   1);
+    add_residual_kernel<<<grid_size, block_size>>>(
+        d_input, d_residual, d_output,
+        batch_size, seq_length, n_embd);
+    CHECK_CUDA(cudaGetLastError());
+}
+
+void Layer::launch_mlp(
+        fp_t* d_input,
+        fp_t* d_output,
+        uint32_t batch_size,
+        uint32_t seq_length) {
+    // Each thread handles one token (i_batch, i_sequence, :)
+    // in the hidden states (batch, sequence, embedding)
+    dim3 block_size(32, 32, 1);
+    dim3 grid_size((batch_size + block_size.x - 1) / block_size.x,
+                   (seq_length + block_size.y - 1) / block_size.y,
+                   1);
+    mlp_kernel<<<grid_size, block_size>>>(
+        d_input, d_output,
+        d_mlp_c_fc_w_0, d_mlp_c_fc_b_0,
+        d_mlp_c_proj_w_0, d_mlp_c_proj_b_0,
+        batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
 }
 
@@ -127,10 +195,6 @@ void Layer::apply(
         uint32_t batch_size,
         uint32_t seq_length,
         uint32_t seq_offset) {
-    // Dimensions
-    dim3 grid_size;
-    dim3 block_size;
-
     // Allocate temporary Q buffer
     fp_t* d_q = nullptr;
     CHECK_CUDA(cudaMalloc(&d_q, (uint64_t)batch_size * seq_length * n_embd * sizeof(fp_t)));
@@ -143,62 +207,20 @@ void Layer::apply(
         cudaMemcpyDeviceToDevice));
     
     // Step 2: First layer normalization
-    launch_layer_normalization(
-        d_hidden_states,
-        d_ln_1_g_0,
-        d_ln_1_b_0,
-        batch_size,
-        seq_length);
+    launch_layer_normalization(d_hidden_states, batch_size, seq_length);
 
     // Step 3: Multi-head attention
     // Step 3.1: QKV projection
-    launch_qkv_projection(
-        d_hidden_states, d_q, d_kv_cache,
-        d_attn_c_attn_w_0, d_attn_c_attn_b_0,
-        batch_size, seq_length, seq_offset);
+    launch_qkv_projection(d_hidden_states, d_q, batch_size, seq_length, seq_offset);
 
     // Step 3.2: Multi-head attention
-    // Each thread handles one token (i_batch, i_sequence, :)
-    // in the hidden states (batch, sequence, embedding)
-    block_size.x = std::min(batch_size, (uint32_t)32);
-    block_size.y = std::min(seq_length, (uint32_t)32);
-    block_size.z = 1;
-    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
-    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
-    grid_size.z = 1;
-    multi_head_attention_kernel<<<grid_size, block_size>>>(
-        d_q, d_kv_cache, d_hidden_states, 
-        batch_size, seq_length, seq_offset, n_head, n_embd);
-    CHECK_CUDA(cudaGetLastError());
+    launch_multi_head_attention(d_q, d_temp, batch_size, seq_length, seq_offset);
 
     // Step 3.3: Final projection
-    // Each thread handles one token (i_batch, i_sequence, :)
-    // in the hidden states (batch, sequence, embedding)
-    block_size.x = std::min(batch_size, (uint32_t)32);
-    block_size.y = std::min(seq_length, (uint32_t)32);
-    block_size.z = 1;
-    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
-    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
-    grid_size.z = 1;
-    final_projection_kernel<<<grid_size, block_size>>>(
-        d_hidden_states, d_temp,
-        d_attn_c_proj_w_0, d_attn_c_proj_b_0,
-        batch_size, seq_length, n_embd);
-    CHECK_CUDA(cudaGetLastError());
+    launch_final_projection(d_temp, d_hidden_states, batch_size, seq_length);
 
     // Step 4: Add residual connection
-    // Each thread handles one token (i_batch, i_sequence, :)
-    // in the hidden states (batch, sequence, embedding)
-    block_size.x = std::min(batch_size, (uint32_t)32);
-    block_size.y = std::min(seq_length, (uint32_t)32);
-    block_size.z = 1;
-    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
-    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
-    grid_size.z = 1;
-    add_residual_kernel<<<grid_size, block_size>>>(
-        d_temp, d_residual, d_hidden_states,
-        batch_size, seq_length, n_embd);
-    CHECK_CUDA(cudaGetLastError());
+    launch_add_residual(d_temp, d_residual, d_hidden_states, batch_size, seq_length);
 
     // Step 5: Save output for residual connection
     CHECK_CUDA(cudaMemcpy(
@@ -208,50 +230,15 @@ void Layer::apply(
         cudaMemcpyDeviceToDevice));
 
     // Step 6: Second layer normalization
-    // Each thread handles one token (i_batch, i_sequence, :)
-    // in the hidden states (batch, sequence, embedding)
-    block_size.x = 256;
-    block_size.y = 1;
-    block_size.z = 1;
-    grid_size.x = batch_size;
-    grid_size.y = seq_length;
-    grid_size.z = 1;
-    layer_normalization_kernel<256, 8><<<grid_size, block_size>>>(
-        d_hidden_states, d_ln_1_g_0, d_ln_1_b_0,
-        batch_size, seq_length, n_embd);
-    CHECK_CUDA(cudaGetLastError());
+    launch_layer_normalization(d_hidden_states, batch_size, seq_length);
 
     // Step 7: MLP (feedforward network)
-    // Each thread handles one token (i_batch, i_sequence, :)
-    // in the hidden states (batch, sequence, embedding)
-    block_size.x = std::min(batch_size, (uint32_t)32);
-    block_size.y = std::min(seq_length, (uint32_t)32);
-    block_size.z = 1;
-    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
-    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
-    grid_size.z = 1;
-    mlp_kernel<<<grid_size, block_size>>>(
-        d_hidden_states, d_temp,
-        d_mlp_c_fc_w_0, d_mlp_c_fc_b_0,
-        d_mlp_c_proj_w_0, d_mlp_c_proj_b_0,
-        batch_size, seq_length, n_embd);
-    CHECK_CUDA(cudaGetLastError());
+    launch_mlp(d_hidden_states, d_temp, batch_size, seq_length);
 
     // Step 8: Add residual connection
-    // Each thread handles one token (i_batch, i_sequence, :)
-    // in the hidden states (batch, sequence, embedding)
-    block_size.x = std::min(batch_size, (uint32_t)32);
-    block_size.y = std::min(seq_length, (uint32_t)32);
-    block_size.z = 1;
-    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
-    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
-    grid_size.z = 1;
-    add_residual_kernel<<<grid_size, block_size>>>(
-        d_temp, d_residual, d_hidden_states,
-        batch_size, seq_length, n_embd);
-    CHECK_CUDA(cudaGetLastError());
+    launch_add_residual(d_temp, d_residual, d_hidden_states, batch_size, seq_length);
 
-    // Free temporary buffers
+    // Free temporary buffer
     std::vector<void*> buffers = {d_q};
     clean_up_memory(buffers);
 }

@@ -147,10 +147,10 @@ void LLM::free_temp_buffers() {
     clean_up_memory(buffers);
 }
 
-void LLM::apply_embeddings(id_t* d_token_ids,
-                           fp_t* d_embeddings,
-                           uint32_t seq_length,
-                           uint32_t seq_offset) {
+void LLM::launch_embeddings(id_t* d_token_ids,
+                            fp_t* d_embeddings,
+                            uint32_t seq_length,
+                            uint32_t seq_offset) {
     // Each block handles one token (i_batch, i_sequence, :)
     // in the token_ids (batch, sequence, embedding)
     dim3 block_size(128, 1, 1);
@@ -161,8 +161,8 @@ void LLM::apply_embeddings(id_t* d_token_ids,
     CHECK_CUDA(cudaGetLastError());
 }
 
-void LLM::apply_final_layer_norm(fp_t* d_hidden_states,
-                                 uint32_t seq_length) {
+void LLM::launch_final_layer_norm(fp_t* d_hidden_states,
+                                  uint32_t seq_length) {
     // Each block handles one token (i_batch, i_sequence, :)
     // in the hidden states (batch, sequence, embedding)
     dim3 block_size(256, 1, 1);
@@ -173,9 +173,9 @@ void LLM::apply_final_layer_norm(fp_t* d_hidden_states,
     CHECK_CUDA(cudaGetLastError());
 }
 
-void LLM::apply_lm_head(fp_t* d_hidden_state,
-                        fp_t* d_logits,
-                        uint32_t seq_length) {
+void LLM::launch_lm_head(fp_t* d_hidden_state,
+                         fp_t* d_logits,
+                         uint32_t seq_length) {
     // GPT-2 uses wte as the lm_head
     // Each thread handles one element (i_batch, i_vocab)
     // in the logits (batch, vocab)
@@ -441,7 +441,7 @@ void LLM::forward_pass(const std::vector<id_t>& token_ids,
         cudaMemcpyHostToDevice));
 
     // Embeddings
-    apply_embeddings(d_token_ids, d_hidden_states, seq_length, seq_offset);
+    launch_embeddings(d_token_ids, d_hidden_states, seq_length, seq_offset);
 
     // Process through transformer layers
     for (uint32_t i = 0; i < n_layer; i++) {
@@ -455,10 +455,10 @@ void LLM::forward_pass(const std::vector<id_t>& token_ids,
     }
 
     // Apply final layer norm
-    apply_final_layer_norm(d_hidden_states, seq_length);
+    launch_final_layer_norm(d_hidden_states, seq_length);
 
     // Get logits for the last token position
-    apply_lm_head(d_hidden_states, d_logits, seq_length);
+    launch_lm_head(d_hidden_states, d_logits, seq_length);
 
     // Synchronize device
     CHECK_CUDA(cudaDeviceSynchronize());

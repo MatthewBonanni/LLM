@@ -52,7 +52,7 @@ class LLM {
 
         void copy_params_host_to_device();
 
-        void apply_embeddings(
+        void launch_embeddings(
             id_t* d_token_ids,
             fp_t* d_embeddings,
             uint32_t seq_length,
@@ -66,11 +66,11 @@ class LLM {
             uint32_t seq_length,
             uint32_t seq_offset);
 
-        void apply_final_layer_norm(
+        void launch_final_layer_norm(
             fp_t* d_hidden_states,
             uint32_t seq_length);
 
-        void apply_lm_head(
+        void launch_lm_head(
             fp_t* d_hidden_states,
             fp_t* d_logits,
             uint32_t seq_length);
