@@ -104,15 +104,15 @@ void Layer::apply(
         cudaMemcpyDeviceToDevice));
     
     // Step 2: First layer normalization
-    // Each thread handles one token (i_batch, i_sequence, :)
+    // Each block handles one token (i_batch, i_sequence, :)
     // in the hidden states (batch, sequence, embedding)
-    block_size.x = std::min(batch_size, (uint32_t)32);
-    block_size.y = std::min(seq_length, (uint32_t)32);
+    block_size.x = 256;
+    block_size.y = 1;
     block_size.z = 1;
-    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
-    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
+    grid_size.x = batch_size;
+    grid_size.y = seq_length;
     grid_size.z = 1;
-    layer_normalization_kernel<<<grid_size, block_size>>>(
+    layer_normalization_kernel<256, 8><<<grid_size, block_size>>>(
         d_hidden_states, d_ln_1_g_0, d_ln_1_b_0,
         batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
@@ -186,14 +186,14 @@ void Layer::apply(
     // Step 6: Second layer normalization
     // Each thread handles one token (i_batch, i_sequence, :)
     // in the hidden states (batch, sequence, embedding)
-    block_size.x = std::min(batch_size, (uint32_t)32);
-    block_size.y = std::min(seq_length, (uint32_t)32);
+    block_size.x = 256;
+    block_size.y = 1;
     block_size.z = 1;
-    grid_size.x = (batch_size + block_size.x - 1) / block_size.x;
-    grid_size.y = (seq_length + block_size.y - 1) / block_size.y;
+    grid_size.x = batch_size;
+    grid_size.y = seq_length;
     grid_size.z = 1;
-    layer_normalization_kernel<<<grid_size, block_size>>>(
-        d_hidden_states, d_ln_2_g_0, d_ln_2_b_0,
+    layer_normalization_kernel<256, 8><<<grid_size, block_size>>>(
+        d_hidden_states, d_ln_1_g_0, d_ln_1_b_0,
         batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
 

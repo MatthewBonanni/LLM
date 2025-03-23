@@ -153,9 +153,9 @@ void LLM::apply_embeddings(id_t* d_token_ids,
                            uint32_t seq_offset) {
     // Each block handles one token (i_batch, i_sequence, :)
     // in the token_ids (batch, sequence, embedding)
-    dim3 grid_size(batch_size, seq_length);
-    dim3 block_size(128);
-    embedding_kernel<<<grid_size, block_size>>>(
+    dim3 block_size(128, 1, 1);
+    dim3 grid_size(batch_size, seq_length, 1);
+    embedding_kernel<128><<<grid_size, block_size>>>(
         d_token_ids, d_wte_0, d_wpe_0, d_embeddings,
         batch_size, seq_length, seq_offset, n_embd);
     CHECK_CUDA(cudaGetLastError());
@@ -163,15 +163,11 @@ void LLM::apply_embeddings(id_t* d_token_ids,
 
 void LLM::apply_final_layer_norm(fp_t* d_hidden_states,
                                  uint32_t seq_length) {
-    // Each thread handles one token (i_batch, i_sequence, :)
+    // Each block handles one token (i_batch, i_sequence, :)
     // in the hidden states (batch, sequence, embedding)
-    dim3 block_size(std::min(batch_size, (uint32_t)32),
-                    std::min(seq_length, (uint32_t)32),
-                    1);
-    dim3 grid_size((batch_size + block_size.x - 1) / block_size.x,
-                   (seq_length + block_size.y - 1) / block_size.y,
-                   1);
-    layer_normalization_kernel<<<grid_size, block_size>>>(
+    dim3 block_size(256, 1, 1);
+    dim3 grid_size(batch_size, seq_length, 1);
+    layer_normalization_kernel<256, 8><<<grid_size, block_size>>>(
         d_hidden_states, d_ln_f_g_0, d_ln_f_b_0,
         batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());

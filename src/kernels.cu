@@ -9,20 +9,26 @@ __device__ __host__ fp_t gelu(fp_t x) {
     return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
 }
 
+template <uint32_t BLOCK_SIZE>
 __global__ void embedding_kernel(
-        id_t* token_ids,
-        fp_t* wte,
-        fp_t* wpe,
-        fp_t* embeddings,
+        const id_t* __restrict__ token_ids,
+        const fp_t* __restrict__ wte,
+        const fp_t* __restrict__ wpe,
+        fp_t* __restrict__ embeddings,
         uint32_t batch_size,
         uint32_t seq_length,
         uint32_t seq_offset,
         uint32_t n_embd) {
     // Calculate thread ID
-    uint32_t idx_batch = blockIdx.x;
-    uint32_t idx_seq = blockIdx.y;
-    uint32_t tidx = threadIdx.x;
-    const uint32_t block_size = blockDim.x;
+    const uint32_t idx_batch = blockIdx.x;
+    const uint32_t idx_seq = blockIdx.y;
+    const uint32_t tidx = threadIdx.x;
+
+    // Check bounds
+    if (idx_batch >= batch_size ||
+        idx_seq   >= seq_length) {
+        return;
+    }
     
     // Shared memory for token ID (one per block)
     __shared__ id_t token_id;
@@ -32,19 +38,20 @@ __global__ void embedding_kernel(
     __syncthreads();
     
     // Calculate base offsets
-    uint64_t out_offset = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
-    uint64_t wte_offset = (uint64_t)token_id * n_embd;
-    uint64_t wpe_offset = ((uint64_t)idx_seq + seq_offset) * n_embd;
+    const uint64_t out_offset = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
+    const uint64_t wte_offset = (uint64_t)token_id * n_embd;
+    const uint64_t wpe_offset = ((uint64_t)idx_seq + seq_offset) * n_embd;
     
     // Iterate over the embedding dimension in chunks of 8
-    for (uint32_t i = tidx * 8; i < n_embd; i += block_size * 8) {
+    #pragma unroll
+    for (uint32_t i = tidx * 8; i < n_embd; i += BLOCK_SIZE * 8) {
         // Load first 4 elements
-        float4 wte_vec1 = *reinterpret_cast<float4*>(&wte[wte_offset + i]);
-        float4 wpe_vec1 = *reinterpret_cast<float4*>(&wpe[wpe_offset + i]);
+        const float4 wte_vec1 = *reinterpret_cast<const float4*>(&wte[wte_offset + i]);
+        const float4 wpe_vec1 = *reinterpret_cast<const float4*>(&wpe[wpe_offset + i]);
         
         // Load next 4 elements
-        float4 wte_vec2 = *reinterpret_cast<float4*>(&wte[wte_offset + i + 4]);
-        float4 wpe_vec2 = *reinterpret_cast<float4*>(&wpe[wpe_offset + i + 4]);
+        const float4 wte_vec2 = *reinterpret_cast<const float4*>(&wte[wte_offset + i + 4]);
+        const float4 wpe_vec2 = *reinterpret_cast<const float4*>(&wpe[wpe_offset + i + 4]);
         
         // Store first 4 elements
         *reinterpret_cast<float4*>(&embeddings[out_offset + i]) = make_float4(
@@ -64,16 +71,31 @@ __global__ void embedding_kernel(
     }
 }
 
+// Explicit instantiation
+template __global__ void embedding_kernel<128>(
+        const id_t* __restrict__ token_ids,
+        const fp_t* __restrict__ wte,
+        const fp_t* __restrict__ wpe,
+        fp_t* __restrict__ embeddings,
+        uint32_t batch_size,
+        uint32_t seq_length,
+        uint32_t seq_offset,
+        uint32_t n_embd);
+
+template <uint32_t BLOCK_SIZE, uint32_t WARPS_PER_BLOCK>
 __global__ void layer_normalization_kernel(
-        fp_t* input,
-        fp_t* gamma,
-        fp_t* beta,
+        fp_t* __restrict__ input,
+        const fp_t* __restrict__ gamma,
+        const fp_t* __restrict__ beta,
         uint32_t batch_size,
         uint32_t seq_length,
         uint32_t n_embd) {
     // Calculate thread ID
-    uint32_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
+    const uint32_t idx_batch = blockIdx.x;
+    const uint32_t idx_seq = blockIdx.y;
+    const uint32_t tidx = threadIdx.x;
+    const uint32_t lane_id = tidx % WARP_SIZE;
+    const uint32_t warp_id = tidx / WARP_SIZE;
 
     // Check bounds
     if (idx_batch >= batch_size ||
@@ -82,32 +104,83 @@ __global__ void layer_normalization_kernel(
     }
 
     // Get the starting index for the current token
-    uint64_t offset_input = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
-
-    // Calculate mean
-    fp_t mean = 0.0f;
-    for (uint32_t i = 0; i < n_embd; i++) {
-        mean += input[offset_input + i];
+    const uint64_t offset_input = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
+    
+    // Shared memory for partial sums - organized by warp for efficient access
+    __shared__ fp_t s_mean[WARPS_PER_BLOCK];
+    __shared__ fp_t s_variance[WARPS_PER_BLOCK];
+    
+    // Local accumulators
+    fp_t sum = 0.0f;
+    fp_t sq_sum = 0.0f;
+    
+    // Calculate local sum and squared sum (with coalesced memory access)
+    #pragma unroll
+    for (uint32_t i = tidx; i < n_embd; i += BLOCK_SIZE) {
+        fp_t val = input[offset_input + i];
+        sum += val;
+        sq_sum += val * val;
     }
-    mean /= n_embd;
-
-    // Calculate variance
-    fp_t var = 0.0f;
-    for (uint32_t i = 0; i < n_embd; i++) {
-        fp_t diff = input[offset_input + i] - mean;
-        var += diff * diff;
+    
+    // Warp-level reduction using shuffle operations
+    #pragma unroll
+    for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        sum    += __shfl_down_sync(0xffffffff, sum,    offset);
+        sq_sum += __shfl_down_sync(0xffffffff, sq_sum, offset);
     }
-    var /= n_embd;
-
-    // Normalize and scale
-    const fp_t epsilon = 1e-5f;
-    fp_t inv_std = rsqrtf(var + epsilon);
-
-    for (uint32_t i = 0; i < n_embd; i++) {
-        fp_t normalized = (input[offset_input + i] - mean) * inv_std;
-        input[offset_input + i] = gamma[i] * normalized + beta[i];
+    
+    // First thread in each warp writes partial results
+    if (lane_id == 0) {
+        s_mean[warp_id] = sum;
+        s_variance[warp_id] = sq_sum;
+    }
+    __syncthreads();
+    
+    // Final reduction across warps (done by first warp)
+    if (warp_id == 0) {
+        // Load 0 for lanes that would access out of bounds
+        fp_t warp_sum = (lane_id < WARPS_PER_BLOCK) ? s_mean[lane_id] : 0.0f;
+        fp_t warp_sq_sum = (lane_id < WARPS_PER_BLOCK) ? s_variance[lane_id] : 0.0f;
+        
+        // Warp-level reduction again
+        #pragma unroll
+        for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+            warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+            warp_sq_sum += __shfl_down_sync(0xffffffff, warp_sq_sum, offset);
+        }
+        
+        // First thread calculates final values
+        if (lane_id == 0) {
+            const fp_t inv_n = 1.0f / n_embd;
+            s_mean[0] = warp_sum * inv_n;
+            fp_t variance = fmaxf(warp_sq_sum * inv_n - s_mean[0] * s_mean[0], 0.0f);
+            s_variance[0] = rsqrtf(variance + 1e-5f);  // inverse standard deviation
+        }
+    }
+    __syncthreads();
+    
+    // Load final mean and inv_std
+    const fp_t mean = s_mean[0];
+    const fp_t inv_std = s_variance[0];
+    
+    // Normalize and scale - ensure coalesced memory access
+    // Each thread handles multiple sequential elements for better instruction throughput
+    #pragma unroll
+    for (uint32_t i = tidx; i < n_embd; i += BLOCK_SIZE) {
+        const fp_t normalized = (input[offset_input + i] - mean) * inv_std;
+        const fp_t scaled = normalized * gamma[i] + beta[i];
+        input[offset_input + i] = scaled;
     }
 }
+
+// Explicit instantiation
+template __global__ void layer_normalization_kernel<256, 8>(
+        fp_t* __restrict__ input,
+        const fp_t* __restrict__ gamma,
+        const fp_t* __restrict__ beta,
+        uint32_t batch_size,
+        uint32_t seq_length,
+        uint32_t n_embd);
 
 __global__ void qkv_projection_kernel(
         fp_t* hidden_states,
@@ -131,7 +204,7 @@ __global__ void qkv_projection_kernel(
 
     // Get the starting index for the current token
     uint64_t offset_hidden = ((uint64_t) idx_batch * seq_length + idx_seq) * n_embd;
-    uint64_t offset_q = ((uint64_t) idx_batch * seq_length + idx_seq             ) * (    n_embd);
+    uint64_t offset_q = ((uint64_t) idx_batch * seq_length + idx_seq) * n_embd;
     uint64_t offset_k = ((uint64_t) idx_batch * (seq_length + seq_offset) + idx_seq + seq_offset) * (2 * n_embd);
     uint64_t offset_v = ((uint64_t) idx_batch * (seq_length + seq_offset) + idx_seq + seq_offset) * (2 * n_embd) + n_embd;
     uint32_t qkv_size = 3 * n_embd; // Size of Q, K, V for each token

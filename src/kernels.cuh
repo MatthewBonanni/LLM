@@ -5,19 +5,30 @@
 
 #include "utils.cuh"
 
+#define WARP_SIZE 32
 #define INTERMEDIATE_SIZE 3072
 #define SEQ_LENGTH_MAX 1024
 
 __device__ __host__ fp_t gelu(fp_t x);
 
+template <uint32_t BLOCK_SIZE>
 __global__ void embedding_kernel(
-    id_t* token_ids,
-    fp_t* wte,
-    fp_t* wpe,
-    fp_t* embeddings,
+    const id_t* __restrict__ token_ids,
+    const fp_t* __restrict__ wte,
+    const fp_t* __restrict__ wpe,
+    fp_t* __restrict__ embeddings,
     uint32_t batch_size,
     uint32_t seq_length,
     uint32_t seq_offset,
+    uint32_t n_embd);
+
+template <uint32_t BLOCK_SIZE, uint32_t WARPS_PER_BLOCK>
+__global__ void layer_normalization_kernel(
+    fp_t* __restrict__ input,
+    const fp_t* __restrict__ gamma,
+    const fp_t* __restrict__ beta,
+    uint32_t batch_size,
+    uint32_t seq_length,
     uint32_t n_embd);
 
 __global__ void qkv_projection_kernel(
@@ -29,14 +40,6 @@ __global__ void qkv_projection_kernel(
     uint32_t batch_size,
     uint32_t seq_length,
     uint32_t seq_offset,
-    uint32_t n_embd);
-
-__global__ void layer_normalization_kernel(
-    fp_t* input,
-    fp_t* gamma,
-    fp_t* beta,
-    uint32_t batch_size,
-    uint32_t seq_length,
     uint32_t n_embd);
 
 __global__ void multi_head_attention_kernel(
