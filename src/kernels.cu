@@ -198,113 +198,49 @@ template __global__ void layer_normalization_kernel<256, 8>(
 __global__ void q_projection_kernel(
         const fp_t* __restrict__ hidden_states,
         fp_t* __restrict__ q,
-        const fp_t* __restrict__ w_q,
-        const fp_t* __restrict__ b_q,
+        const fp_t* __restrict__ w_qkv,
+        const fp_t* __restrict__ b_qkv,
         uint32_t batch_size,
         uint32_t seq_length,
         uint32_t n_embd) {
-    // Calculate batch and sequence indices
-    uint32_t batch_idx = blockIdx.z;
-    uint32_t seq_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    // Calculate batch and embedding indices
+    uint32_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t idx_embd = blockIdx.y * blockDim.y + threadIdx.y;
 
     // Check bounds
-    if (batch_idx >= batch_size ||
-        seq_idx   >= seq_length) {
+    if (idx_batch >= batch_size ||
+        idx_embd  >= n_embd) {
         return;
     }
 
-    // Calculate tile indices
-    uint32_t tile_x = threadIdx.x;
-    uint32_t tile_y = threadIdx.y % WMMA_M;
-
     // Calculate memory offsets
-    uint64_t hidden_offset = ((uint64_t)batch_idx * seq_length + seq_idx) * n_embd;
-    uint64_t q_offset = ((uint64_t)batch_idx * seq_length + seq_idx) * n_embd;
+    uint64_t hidden_offset = ((uint64_t)idx_batch * seq_length + (seq_length - 1)) * n_embd;
+    uint64_t q_offset = (uint64_t)idx_batch * n_embd;
 
-    // Allocate shared memory for tiling
-    extern __shared__ half smem[];
-    half* hidden_shared = &smem[0];
-    half* q_weights_shared = &smem[WMMA_M * n_embd];
-
-    // Initialize fragments
-    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> hidden_frag;
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> q_weights_frag;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> q_frag;
-
-    wmma::fill_fragment(hidden_frag, 0.0f);
-    wmma::fill_fragment(q_weights_frag, 0.0f);
-    wmma::fill_fragment(q_frag, 0.0f);
-
-    // // Copy bias values into output array
-    #pragma unroll 4
-    for (uint32_t i = tile_x; i < n_embd; i += blockDim.x) {
-        q[q_offset + i] = __float2half(b_q[i]);
+    // Perform Q projection
+    float val = b_qkv[idx_embd];
+    for (uint32_t i = 0; i < n_embd; i++) {
+        val += hidden_states[hidden_offset + i] * w_qkv[i * 3 * n_embd + idx_embd];
     }
-
-    __syncthreads();
-
-    // Process in tiles of WMMA_K
-    for (uint32_t k_idx = 0; k_idx < n_embd; k_idx += WMMA_K) {
-        // Load hidden states into shared memory
-        #pragma unroll 4
-        for (uint32_t i = tile_x; i < WMMA_K && (k_idx + i) < n_embd; i += blockDim.x) {
-            hidden_shared[tile_y * WMMA_K + i] = __float2half(hidden_states[hidden_offset + k_idx + i]);
-        }
-
-        // Load Q weights into shared memory
-        #pragma unroll 4
-        for (uint32_t i = tile_y; i < WMMA_M && i < n_embd; i += blockDim.y) {
-            #pragma unroll 4
-            for (uint32_t j = tile_x; j < WMMA_K && (k_idx + j) < n_embd; j += blockDim.x) {
-                q_weights_shared[i * WMMA_K + j] = __float2half(w_q[(k_idx + j) * n_embd + i]);
-            }
-        }
-
-        // Synchronize after loading data to shared memory
-        __syncthreads();
-
-        // Load fragments
-        wmma::load_matrix_sync(hidden_frag, hidden_shared, WMMA_K);
-        wmma::load_matrix_sync(q_weights_frag, q_weights_shared, WMMA_K);
-
-        // Perform matrix multiplication using tensor cores
-        wmma::mma_sync(q_frag, hidden_frag, q_weights_frag, q_frag);
-
-        // Only one synchronization needed here
-        __syncthreads();
-    }
-
-    // Store results
-    uint32_t warp_id = threadIdx.y / warpSize;
-    uint32_t lane_id = threadIdx.x + (threadIdx.y % warpSize) * blockDim.x;
-    if (lane_id < WMMA_M * WMMA_N) {
-        uint32_t col = lane_id % WMMA_N;
-        uint32_t row = lane_id / WMMA_N;
-        if (row < WMMA_M && col < WMMA_N && (row * WMMA_N + col) < n_embd) {
-            uint32_t out_idx = q_offset + (warp_id * WMMA_M * WMMA_N) + row * WMMA_N + col;
-            if (out_idx < q_offset + n_embd) {
-                q[out_idx] += q_frag.x[row * WMMA_N + col];
-            }
-        }
-    }
+    q[q_offset + idx_embd] = val;
 }
 
 __global__ void kv_projection_kernel(
         const fp_t* __restrict__ hidden_states,
         half* __restrict__ kv,
-        const fp_t* __restrict__ w_kv,
-        const fp_t* __restrict__ b_kv,
+        const fp_t* __restrict__ w_qkv,
+        const fp_t* __restrict__ b_qkv,
         uint32_t batch_size,
         uint32_t seq_length,
         uint32_t seq_offset,
         uint32_t n_embd) {
     // Calculate batch and sequence indices
-    uint32_t batch_idx = blockIdx.z;
-    uint32_t seq_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    uint32_t idx_batch = blockIdx.z;
+    uint32_t idx_seq = blockIdx.y * blockDim.y + threadIdx.y;
 
     // Check bounds
-    if (batch_idx >= batch_size ||
-        seq_idx   >= seq_length) {
+    if (idx_batch >= batch_size ||
+        idx_seq   >= seq_length) {
         return;
     }
 
@@ -313,8 +249,8 @@ __global__ void kv_projection_kernel(
     uint32_t tile_y = threadIdx.y % WMMA_M;
 
     // Calculate memory offsets
-    uint64_t hidden_offset = ((uint64_t)batch_idx * seq_length + seq_idx) * n_embd;
-    uint64_t kv_offset = ((uint64_t)batch_idx * (seq_length + seq_offset) + seq_idx + seq_offset) * (2 * n_embd);
+    uint64_t hidden_offset = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
+    uint64_t kv_offset = ((uint64_t)idx_batch * (seq_length + seq_offset) + idx_seq + seq_offset) * (2 * n_embd);
     
     // Allocate shared memory for tiling - optimized layout for KV
     extern __shared__ half smem[];
@@ -337,8 +273,8 @@ __global__ void kv_projection_kernel(
     
     // Copy bias values into output arrays
     for (uint32_t i = tile_x; i < n_embd; i += blockDim.x) {
-        kv[kv_offset + i] = __float2half(b_kv[i]);
-        kv[kv_offset + n_embd + i] = __float2half(b_kv[n_embd + i]);
+        kv[kv_offset +          i] = __float2half(b_qkv[    n_embd + i]);
+        kv[kv_offset + n_embd + i] = __float2half(b_qkv[2 * n_embd + i]);
     }
     
     __syncthreads();
@@ -353,8 +289,8 @@ __global__ void kv_projection_kernel(
         // Load KV weights into shared memory
         for (uint32_t i = tile_y; i < WMMA_M && i < n_embd; i += blockDim.y) {
             for (uint32_t j = tile_x; j < WMMA_K && (k_idx + j) < n_embd; j += blockDim.x) {
-                k_weights_shared[i * WMMA_K + j] = __float2half(w_kv[(k_idx + j) * (2 * n_embd) + i]);
-                v_weights_shared[i * WMMA_K + j] = __float2half(w_kv[(k_idx + j) * (2 * n_embd) + n_embd + i]);
+                k_weights_shared[i * WMMA_K + j] = __float2half(w_qkv[(k_idx + j) * (3 * n_embd) + n_embd + i]);
+                v_weights_shared[i * WMMA_K + j] = __float2half(w_qkv[(k_idx + j) * (3 * n_embd) + (2 * n_embd) + i]);
             }
         }
         

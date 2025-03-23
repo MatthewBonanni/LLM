@@ -37,8 +37,8 @@ __global__ void layer_normalization_kernel(
 __global__ void q_projection_kernel(
     const fp_t* __restrict__ hidden_states,
     fp_t* __restrict__ q,
-    const fp_t* __restrict__ w_q,
-    const fp_t* __restrict__ b_q,
+    const fp_t* __restrict__ w_qkv,
+    const fp_t* __restrict__ b_qkv,
     uint32_t batch_size,
     uint32_t seq_length,
     uint32_t n_embd);
@@ -46,8 +46,8 @@ __global__ void q_projection_kernel(
 __global__ void kv_projection_kernel(
     const fp_t* __restrict__ hidden_states,
     half* __restrict__ kv,
-    const fp_t* __restrict__ w_kv,
-    const fp_t* __restrict__ b_kv,
+    const fp_t* __restrict__ w_qkv,
+    const fp_t* __restrict__ b_qkv,
     uint32_t batch_size,
     uint32_t seq_length,
     uint32_t seq_offset,
