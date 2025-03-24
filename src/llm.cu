@@ -194,9 +194,6 @@ void LLM::launch_lm_head(fp_t* d_hidden_state,
 void LLM::copy_params_host_to_device() {
     CHECK_CUDA(cudaMemcpy(d_wte_0, h_wte_0.data(), h_wte_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_wpe_0, h_wpe_0.data(), h_wpe_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
-    for (uint32_t i = 0; i < n_layer; i++) {
-        layers[i]->copy_host_to_device();
-    }
     CHECK_CUDA(cudaMemcpy(d_ln_f_b_0, h_ln_f_b_0.data(), h_ln_f_b_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_ln_f_g_0, h_ln_f_g_0.data(), h_ln_f_g_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
 }

@@ -14,8 +14,12 @@ Layer::Layer(uint32_t n_ctx, uint32_t n_embd, uint32_t n_head) :
         n_ctx(n_ctx),
         n_embd(n_embd),
         n_head(n_head),
-        d_attn_c_attn_w_0(nullptr),
-        d_attn_c_attn_b_0(nullptr),
+        d_attn_c_attn_w_Q_0(nullptr),
+        d_attn_c_attn_w_K_0(nullptr),
+        d_attn_c_attn_w_V_0(nullptr),
+        d_attn_c_attn_b_Q_0(nullptr),
+        d_attn_c_attn_b_K_0(nullptr),
+        d_attn_c_attn_b_V_0(nullptr),
         d_attn_c_proj_w_0(nullptr),
         d_attn_c_proj_b_0(nullptr),
         d_ln_1_b_0(nullptr),
@@ -26,25 +30,16 @@ Layer::Layer(uint32_t n_ctx, uint32_t n_embd, uint32_t n_head) :
         d_mlp_c_fc_b_0(nullptr),
         d_mlp_c_proj_w_0(nullptr),
         d_mlp_c_proj_b_0(nullptr),
-        d_kv_cache(nullptr),
+        d_k_cache(nullptr),
+        d_v_cache(nullptr),
         kv_cache_size(0) {
-    // Allocate memory on host
-    h_attn_c_attn_w_0.resize(n_embd * 3 * n_embd);
-    h_attn_c_attn_b_0.resize(3 * n_embd);
-    h_attn_c_proj_w_0.resize(n_embd * n_embd);
-    h_attn_c_proj_b_0.resize(n_embd);
-    h_ln_1_b_0.resize(n_embd);
-    h_ln_1_g_0.resize(n_embd);
-    h_ln_2_b_0.resize(n_embd);
-    h_ln_2_g_0.resize(n_embd);
-    h_mlp_c_fc_w_0.resize(n_embd * 4 * n_embd);
-    h_mlp_c_fc_b_0.resize(4 * n_embd);
-    h_mlp_c_proj_w_0.resize(4 * n_embd * n_embd);
-    h_mlp_c_proj_b_0.resize(n_embd);
-
     // Allocate memory on device
-    CHECK_CUDA(cudaMalloc(&d_attn_c_attn_w_0, n_embd * 3 * n_embd * sizeof(fp_t)));
-    CHECK_CUDA(cudaMalloc(&d_attn_c_attn_b_0, 3 * n_embd * sizeof(fp_t)));
+    CHECK_CUDA(cudaMalloc(&d_attn_c_attn_w_Q_0, n_embd * n_embd * sizeof(fp_t)));
+    CHECK_CUDA(cudaMalloc(&d_attn_c_attn_w_K_0, n_embd * n_embd * sizeof(fp_t)));
+    CHECK_CUDA(cudaMalloc(&d_attn_c_attn_w_V_0, n_embd * n_embd * sizeof(fp_t)));
+    CHECK_CUDA(cudaMalloc(&d_attn_c_attn_b_Q_0, n_embd * sizeof(fp_t)));
+    CHECK_CUDA(cudaMalloc(&d_attn_c_attn_b_K_0, n_embd * sizeof(fp_t)));
+    CHECK_CUDA(cudaMalloc(&d_attn_c_attn_b_V_0, n_embd * sizeof(fp_t)));
     CHECK_CUDA(cudaMalloc(&d_attn_c_proj_w_0, n_embd * n_embd * sizeof(fp_t)));
     CHECK_CUDA(cudaMalloc(&d_attn_c_proj_b_0, n_embd * sizeof(fp_t)));
     CHECK_CUDA(cudaMalloc(&d_ln_1_b_0, n_embd * sizeof(fp_t)));
@@ -60,8 +55,12 @@ Layer::Layer(uint32_t n_ctx, uint32_t n_embd, uint32_t n_head) :
 Layer::~Layer() {
     // Free memory on device
     std::vector<void*> buffers = {
-        d_attn_c_attn_w_0,
-        d_attn_c_attn_b_0,
+        d_attn_c_attn_w_Q_0,
+        d_attn_c_attn_w_K_0,
+        d_attn_c_attn_w_V_0,
+        d_attn_c_attn_b_Q_0,
+        d_attn_c_attn_b_K_0,
+        d_attn_c_attn_b_V_0,
         d_attn_c_proj_w_0,
         d_attn_c_proj_b_0,
         d_ln_1_b_0,
@@ -72,13 +71,15 @@ Layer::~Layer() {
         d_mlp_c_fc_b_0,
         d_mlp_c_proj_w_0,
         d_mlp_c_proj_b_0,
-        d_kv_cache
+        d_k_cache,
+        d_v_cache
     };
     clean_up_memory(buffers);
 }
 
 void Layer::allocate_kv_cache(uint32_t batch_size) {
-    CHECK_CUDA(cudaMalloc(&d_kv_cache, (uint64_t)batch_size * n_ctx * 2 * n_embd * sizeof(half)));
+    CHECK_CUDA(cudaMalloc(&d_k_cache, (uint64_t)batch_size * n_ctx * n_embd * sizeof(half)));
+    CHECK_CUDA(cudaMalloc(&d_v_cache, (uint64_t)batch_size * n_ctx * n_embd * sizeof(half)));
 }
 
 void Layer::launch_layer_normalization(
@@ -101,63 +102,65 @@ void Layer::launch_qkv_projection(
         uint32_t batch_size,
         uint32_t seq_length,
         uint32_t seq_offset) {
-    // Each block handles one token (i_batch, i_sequence, :)
-    // in the hidden states (batch, sequence, embedding)
-    dim3 block_size_q(32, 32, 1);
-    dim3 grid_size_q(1,
-                     (seq_length + block_size_q.y - 1) / block_size_q.y,
-                     batch_size);
-    size_t shared_mem_size_q = (WMMA_M * n_embd + WMMA_M * WMMA_K) * sizeof(half);
-    q_projection_kernel<<<grid_size_q, block_size_q, shared_mem_size_q>>>(
+    constexpr uint32_t BLOCK_M = 16;
+    constexpr uint32_t BLOCK_N = 16;
+    constexpr uint32_t BLOCK_K = 16;
+    constexpr uint32_t WARPS_PER_BLOCK = (BLOCK_M/WMMA_M * BLOCK_N/WMMA_N);
+    dim3 grid_size_q(((n_embd     + BLOCK_N - 1) / BLOCK_N),
+                     ((batch_size + BLOCK_M - 1) / BLOCK_M),
+                     1);
+    dim3 block_size_q(WARP_SIZE, WARPS_PER_BLOCK, 1);
+    uint32_t shared_mem_size_q = (BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N) * sizeof(half);
+    q_projection_kernel<BLOCK_M, BLOCK_N, BLOCK_K><<<grid_size_q, block_size_q, shared_mem_size_q>>>(
         d_hidden_states, d_q,
-        d_attn_c_attn_w_0, d_attn_c_attn_b_0,
+        d_attn_c_attn_w_Q_0, d_attn_c_attn_b_Q_0,
         batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
 
     // DEBUG
-    // std::vector<fp_t> h_hidden_states(batch_size * seq_length * n_embd);
-    // CHECK_CUDA(cudaMemcpy(
-    //     h_hidden_states.data(),
-    //     d_hidden_states,
-    //     (uint64_t)batch_size * seq_length * n_embd * sizeof(fp_t),
-    //     cudaMemcpyDeviceToHost));
-    // std::cout << "Hidden states:" << std::endl;
-    // for (uint32_t i = 0; i < batch_size; i++) {
-    //     for (uint32_t j = 0; j < seq_length; j++) {
-    //         for (uint32_t k = 0; k < 5; k++) {
-    //             std::cout << h_hidden_states[(uint64_t)i * seq_length * n_embd + (uint64_t)j * n_embd + k] << " ";
-    //         }
-    //         std::cout << std::endl;
-    //     }
-    // }
-    // std::cout << std::endl;
+    std::vector<fp_t> h_hidden_states(batch_size * seq_length * n_embd);
+    CHECK_CUDA(cudaMemcpy(
+        h_hidden_states.data(),
+        d_hidden_states,
+        (uint64_t)batch_size * seq_length * n_embd * sizeof(fp_t),
+        cudaMemcpyDeviceToHost));
+    std::cout << "Hidden states:" << std::endl;
+    for (uint32_t i = 0; i < batch_size; i++) {
+        for (uint32_t j = 0; j < seq_length; j++) {
+            for (uint32_t k = 0; k < 5; k++) {
+                std::cout << h_hidden_states[(uint64_t)i * seq_length * n_embd + (uint64_t)j * n_embd + k] << " ";
+            }
+            std::cout << std::endl;
+        }
+    }
+    std::cout << std::endl;
 
-    // std::vector<fp_t> h_q(batch_size * n_embd);
-    // CHECK_CUDA(cudaMemcpy(
-    //     h_q.data(),
-    //     d_q,
-    //     (uint64_t)batch_size * n_embd * sizeof(fp_t),
-    //     cudaMemcpyDeviceToHost));
-    // std::cout << "Q:" << std::endl;
-    // for (uint32_t i = 0; i < batch_size; i++) {
-    //     for (uint32_t j = 0; j < 5; j++) {
-    //         std::cout << h_q[(uint64_t)i * n_embd + j] << " ";
-    //     }
-    //     std::cout << std::endl;
-    // }
-    // exit(0);
+    std::vector<fp_t> h_q(batch_size * n_embd);
+    CHECK_CUDA(cudaMemcpy(
+        h_q.data(),
+        d_q,
+        (uint64_t)batch_size * n_embd * sizeof(fp_t),
+        cudaMemcpyDeviceToHost));
+    std::cout << "Q:" << std::endl;
+    for (uint32_t i = 0; i < batch_size; i++) {
+        for (uint32_t j = 0; j < 5; j++) {
+            std::cout << h_q[(uint64_t)i * n_embd + j] << " ";
+        }
+        std::cout << std::endl;
+    }
+    exit(0);
     
-    dim3 block_size_kv(32, 16, 1);
-    dim3 grid_size_kv(1,
-                      (seq_length + block_size_kv.y - 1) / block_size_kv.y,
-                      batch_size);
-    size_t shared_mem_size_kv = (WMMA_M * n_embd + 2 * WMMA_M * WMMA_K) * sizeof(half);
-    fp_t* w_kv = d_attn_c_attn_w_0 + n_embd * n_embd;
-    fp_t* b_kv = d_attn_c_attn_b_0 + n_embd;
-    kv_projection_kernel<<<grid_size_kv, block_size_kv, shared_mem_size_kv>>>(
-        d_hidden_states, d_kv_cache, w_kv, b_kv,
-        batch_size, seq_length, seq_offset, n_embd);
-    CHECK_CUDA(cudaGetLastError());
+    // dim3 block_size_kv(32, 16, 1);
+    // dim3 grid_size_kv(1,
+    //                   (seq_length + block_size_kv.y - 1) / block_size_kv.y,
+    //                   batch_size);
+    // size_t shared_mem_size_kv = (WMMA_M * n_embd + 2 * WMMA_M * WMMA_K) * sizeof(half);
+    // fp_t* w_kv = d_attn_c_attn_w_0 + n_embd * n_embd;
+    // fp_t* b_kv = d_attn_c_attn_b_0 + n_embd;
+    // kv_projection_kernel<<<grid_size_kv, block_size_kv, shared_mem_size_kv>>>(
+    //     d_hidden_states, d_kv_cache, w_kv, b_kv,
+    //     batch_size, seq_length, seq_offset, n_embd);
+    // CHECK_CUDA(cudaGetLastError());
 }
 
 void Layer::launch_multi_head_attention(
@@ -173,7 +176,7 @@ void Layer::launch_multi_head_attention(
                    (seq_length + block_size.y - 1) / block_size.y,
                    1);
     multi_head_attention_kernel<<<grid_size, block_size>>>(
-        d_q, d_kv_cache, d_output,
+        d_q, d_k_cache, d_v_cache, d_output,
         batch_size, seq_length, seq_offset, n_head, n_embd);
     CHECK_CUDA(cudaGetLastError());
 }
@@ -289,6 +292,21 @@ void Layer::apply(
 }
 
 void Layer::load_from_hdf5(hid_t file_id, const std::string& layer_path) {
+    // Host buffers
+    std::vector<fp_t> h_attn_c_attn_w_0(n_embd * 3 * n_embd);
+    std::vector<fp_t> h_attn_c_attn_b_0(3 * n_embd);
+    std::vector<fp_t> h_attn_c_proj_w_0(n_embd * n_embd);
+    std::vector<fp_t> h_attn_c_proj_b_0(n_embd);
+    std::vector<fp_t> h_ln_1_b_0(n_embd);
+    std::vector<fp_t> h_ln_1_g_0(n_embd);
+    std::vector<fp_t> h_ln_2_b_0(n_embd);
+    std::vector<fp_t> h_ln_2_g_0(n_embd);
+    std::vector<fp_t> h_mlp_c_fc_w_0(n_embd * 4 * n_embd);
+    std::vector<fp_t> h_mlp_c_fc_b_0(4 * n_embd);
+    std::vector<fp_t> h_mlp_c_proj_w_0(4 * n_embd * n_embd);
+    std::vector<fp_t> h_mlp_c_proj_b_0(n_embd);
+
+    // Read datasets from HDF5 file
     read_dataset(file_id, layer_path + "/attn/c_attn/w_0", h_attn_c_attn_w_0);
     read_dataset(file_id, layer_path + "/attn/c_attn/b_0", h_attn_c_attn_b_0);
     read_dataset(file_id, layer_path + "/attn/c_proj/w_0", h_attn_c_proj_w_0);
@@ -301,11 +319,33 @@ void Layer::load_from_hdf5(hid_t file_id, const std::string& layer_path) {
     read_dataset(file_id, layer_path + "/mlp/c_fc/b_0",    h_mlp_c_fc_b_0);
     read_dataset(file_id, layer_path + "/mlp/c_proj/w_0",  h_mlp_c_proj_w_0);
     read_dataset(file_id, layer_path + "/mlp/c_proj/b_0",  h_mlp_c_proj_b_0);
-}
 
-void Layer::copy_host_to_device() {
-    CHECK_CUDA(cudaMemcpy(d_attn_c_attn_w_0, h_attn_c_attn_w_0.data(), h_attn_c_attn_w_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_attn_c_attn_b_0, h_attn_c_attn_b_0.data(), h_attn_c_attn_b_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
+    // Separate attention weights and biases into Q, K, and V
+    std::vector<fp_t> h_attn_c_attn_w_Q_0(n_embd * n_embd);
+    std::vector<fp_t> h_attn_c_attn_w_K_0(n_embd * n_embd);
+    std::vector<fp_t> h_attn_c_attn_w_V_0(n_embd * n_embd);
+    std::vector<fp_t> h_attn_c_attn_b_Q_0(n_embd);
+    std::vector<fp_t> h_attn_c_attn_b_K_0(n_embd);
+    std::vector<fp_t> h_attn_c_attn_b_V_0(n_embd);
+    for (uint32_t i = 0; i < n_embd; i++) {
+        for (uint32_t j = 0; j < n_embd; j++) {
+            // Store in column-major order
+            h_attn_c_attn_w_Q_0[j * n_embd + i] = h_attn_c_attn_w_0[i * n_embd * 3 +              j];
+            h_attn_c_attn_w_K_0[j * n_embd + i] = h_attn_c_attn_w_0[i * n_embd * 3 +     n_embd + j];
+            h_attn_c_attn_w_V_0[j * n_embd + i] = h_attn_c_attn_w_0[i * n_embd * 3 + 2 * n_embd + j];
+        }
+        h_attn_c_attn_b_Q_0[i] = h_attn_c_attn_b_0[             i];
+        h_attn_c_attn_b_K_0[i] = h_attn_c_attn_b_0[    n_embd + i];
+        h_attn_c_attn_b_V_0[i] = h_attn_c_attn_b_0[2 * n_embd + i];
+    }
+
+    // Copy to device
+    CHECK_CUDA(cudaMemcpy(d_attn_c_attn_w_Q_0, h_attn_c_attn_w_Q_0.data(), h_attn_c_attn_w_Q_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_attn_c_attn_w_K_0, h_attn_c_attn_w_K_0.data(), h_attn_c_attn_w_K_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_attn_c_attn_w_V_0, h_attn_c_attn_w_V_0.data(), h_attn_c_attn_w_V_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_attn_c_attn_b_Q_0, h_attn_c_attn_b_Q_0.data(), h_attn_c_attn_b_Q_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_attn_c_attn_b_K_0, h_attn_c_attn_b_K_0.data(), h_attn_c_attn_b_K_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_attn_c_attn_b_V_0, h_attn_c_attn_b_V_0.data(), h_attn_c_attn_b_V_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_attn_c_proj_w_0, h_attn_c_proj_w_0.data(), h_attn_c_proj_w_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_attn_c_proj_b_0, h_attn_c_proj_b_0.data(), h_attn_c_proj_b_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_ln_1_b_0, h_ln_1_b_0.data(), h_ln_1_b_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
@@ -316,19 +356,4 @@ void Layer::copy_host_to_device() {
     CHECK_CUDA(cudaMemcpy(d_mlp_c_fc_b_0, h_mlp_c_fc_b_0.data(), h_mlp_c_fc_b_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_mlp_c_proj_w_0, h_mlp_c_proj_w_0.data(), h_mlp_c_proj_w_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_mlp_c_proj_b_0, h_mlp_c_proj_b_0.data(), h_mlp_c_proj_b_0.size() * sizeof(fp_t), cudaMemcpyHostToDevice));
-}
-
-void Layer::copy_device_to_host() {
-    CHECK_CUDA(cudaMemcpy(h_attn_c_attn_w_0.data(), d_attn_c_attn_w_0, h_attn_c_attn_w_0.size() * sizeof(fp_t), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_attn_c_attn_b_0.data(), d_attn_c_attn_b_0, h_attn_c_attn_b_0.size() * sizeof(fp_t), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_attn_c_proj_w_0.data(), d_attn_c_proj_w_0, h_attn_c_proj_w_0.size() * sizeof(fp_t), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_attn_c_proj_b_0.data(), d_attn_c_proj_b_0, h_attn_c_proj_b_0.size() * sizeof(fp_t), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_ln_1_b_0.data(), d_ln_1_b_0, h_ln_1_b_0.size() * sizeof(fp_t), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_ln_1_g_0.data(), d_ln_1_g_0, h_ln_1_g_0.size() * sizeof(fp_t), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_ln_2_b_0.data(), d_ln_2_b_0, h_ln_2_b_0.size() * sizeof(fp_t), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_ln_2_g_0.data(), d_ln_2_g_0, h_ln_2_g_0.size() * sizeof(fp_t), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_mlp_c_fc_w_0.data(), d_mlp_c_fc_w_0, h_mlp_c_fc_w_0.size() * sizeof(fp_t), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_mlp_c_fc_b_0.data(), d_mlp_c_fc_b_0, h_mlp_c_fc_b_0.size() * sizeof(fp_t), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_mlp_c_proj_w_0.data(), d_mlp_c_proj_w_0, h_mlp_c_proj_w_0.size() * sizeof(fp_t), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_mlp_c_proj_b_0.data(), d_mlp_c_proj_b_0, h_mlp_c_proj_b_0.size() * sizeof(fp_t), cudaMemcpyDeviceToHost));
 }

@@ -195,35 +195,147 @@ template __global__ void layer_normalization_kernel<256, 8>(
         uint32_t seq_length,
         uint32_t n_embd);
 
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
 __global__ void q_projection_kernel(
         const fp_t* __restrict__ hidden_states,
         fp_t* __restrict__ q,
-        const fp_t* __restrict__ w_qkv,
-        const fp_t* __restrict__ b_qkv,
+        const fp_t* __restrict__ w_q,
+        const fp_t* __restrict__ b_q,
         uint32_t batch_size,
         uint32_t seq_length,
         uint32_t n_embd) {
-    // Calculate batch and embedding indices
-    uint32_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t idx_embd = blockIdx.y * blockDim.y + threadIdx.y;
+    // Warp index within the block
+    int warp_id = (threadIdx.y * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int warp_m = warp_id % (BLOCK_M / WMMA_M);
+    int warp_n = warp_id / (BLOCK_M / WMMA_M);
 
-    // Check bounds
-    if (idx_batch >= batch_size ||
-        idx_embd  >= n_embd) {
-        return;
+    // Block-level tile starting positions
+    int block_tile_m = blockIdx.x * BLOCK_M;
+    int block_tile_n = blockIdx.y * BLOCK_N;
+    
+    // Define shared memory for A and B tiles
+    extern __shared__ half smem[];
+    half* hidden_shared = &smem[0];
+    half* w_q_shared = &smem[BLOCK_M * BLOCK_K];
+
+    // Warp-level tile starting positions
+    int warp_tile_m = block_tile_m + warp_m * WMMA_M;
+    int warp_tile_n = block_tile_n + warp_n * WMMA_N;
+    
+    // Declare the fragments
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+    // Initialize the accumulator fragment with bias values
+    // We need to load the appropriate bias values based on the output columns
+    for (int i = 0; i < c_frag.num_elements; i++) {
+        // Calculate the corresponding column for this fragment element
+        int col_offset = i % WMMA_N;
+        int col = warp_tile_n + col_offset;
+        
+        // Initialize with bias if within bounds, otherwise with zero
+        if (col < n_embd) {
+            c_frag.x[i] = b_q[col];
+        } else {
+            c_frag.x[i] = 0.0f;
+        }
     }
 
-    // Calculate memory offsets
-    uint64_t hidden_offset = ((uint64_t)idx_batch * seq_length + (seq_length - 1)) * n_embd;
-    uint64_t q_offset = (uint64_t)idx_batch * n_embd;
+    // Loop over k dimension
+    for (int k_block = 0; k_block < n_embd; k_block += BLOCK_K) {
+        // First, cooperatively load A (hidden_states) and B (w_q) from global to shared memory
+        // Each thread loads multiple elements
 
-    // Perform Q projection
-    float val = b_qkv[idx_embd];
-    for (uint32_t i = 0; i < n_embd; i++) {
-        val += hidden_states[hidden_offset + i] * w_qkv[i * 3 * n_embd + idx_embd];
+        // Thread indices for loading matrices
+        int thread_id = threadIdx.y * blockDim.x + threadIdx.x;
+        int threads_per_block = blockDim.x * blockDim.y;
+
+        // Calculate how many elements each thread needs to load
+        int A_elements_per_thread = (BLOCK_M * BLOCK_K + threads_per_block - 1) / threads_per_block;
+        int B_elements_per_thread = (BLOCK_K * BLOCK_N + threads_per_block - 1) / threads_per_block;
+
+        // Load A (hidden_states) from global to shared memory
+        for (int i = 0; i < A_elements_per_thread; i++) {
+            int element_id = thread_id + i * threads_per_block;
+            if (element_id < BLOCK_M * BLOCK_K) {
+                int m_idx = element_id / BLOCK_K;
+                int k_idx = element_id % BLOCK_K;
+                
+                // Check bounds
+                if ((block_tile_m + m_idx) < batch_size && (k_block + k_idx) < n_embd) {
+                    // Calculate global index for A (MxDxK, row-major)
+                    // A[m][d_idx][k] -> m * (D * K) + d_idx * K + k
+                    int global_idx = (block_tile_m + m_idx) * (seq_length * n_embd) +
+                                     (seq_length - 1) * n_embd +
+                                     (k_block + k_idx);
+                    hidden_shared[m_idx * BLOCK_K + k_idx] = hidden_states[global_idx];
+                } else {
+                    hidden_shared[m_idx * BLOCK_K + k_idx] = __float2half(0.0f);
+                }
+            }
+        }
+
+        // Load B (w_q) from global to shared memory
+        for (int i = 0; i < B_elements_per_thread; i++) {
+            int element_id = thread_id + i * threads_per_block;
+            if (element_id < BLOCK_K * BLOCK_N) {
+                int k_idx = element_id / BLOCK_N;
+                int n_idx = element_id % BLOCK_N;
+                
+                // Check bounds
+                if ((k_block + k_idx) < n_embd && (block_tile_n + n_idx) < n_embd) {
+                    // Calculate global index for B (KxN, column-major)
+                    // B[k][n] -> k + N * n
+                    int global_idx = (k_block + k_idx) + n_embd * (block_tile_n + n_idx);
+                    w_q_shared[k_idx + BLOCK_N * n_idx] = w_q[global_idx];
+                } else {
+                    w_q_shared[k_idx + BLOCK_N * n_idx] = __float2half(0.0f);
+                }
+            }
+        }
+
+        __syncthreads();
+
+        // Loop over the shared tile with Tensor Core operations
+        for (int k_warp = 0; k_warp < BLOCK_K; k_warp += WMMA_K) {
+            // Load A and B from shared memory into fragments
+            int a_row = warp_m * WMMA_M;
+            int a_col = k_warp;
+            int b_row = k_warp;
+            int b_col = warp_n * WMMA_N;
+            
+            // Load matrix fragments from shared memory
+            wmma::load_matrix_sync(a_frag, &hidden_shared[a_row + BLOCK_K * a_col], BLOCK_K);
+            wmma::load_matrix_sync(b_frag, &w_q_shared[b_row + BLOCK_N * b_col], BLOCK_N);
+            
+            // Perform matrix multiplication
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+
+        // Ensure all warps have finished using shared memory
+        __syncthreads();
     }
-    q[q_offset + idx_embd] = val;
+
+    // Store the output
+    int c_row = warp_tile_m;
+    int c_col = warp_tile_n;
+
+    // Check bounds before storing
+    if (c_row < batch_size && c_col < n_embd) {
+        wmma::store_matrix_sync(&q[c_row * n_embd + c_col], c_frag, n_embd, wmma::mem_row_major);
+    }
 }
+
+// Explicit instantiation
+template __global__ void q_projection_kernel<16, 16, 16>(
+        const fp_t* __restrict__ hidden_states,
+        fp_t* __restrict__ q,
+        const fp_t* __restrict__ w_q,
+        const fp_t* __restrict__ b_q,
+        uint32_t batch_size,
+        uint32_t seq_length,
+        uint32_t n_embd);
 
 __global__ void kv_projection_kernel(
         const fp_t* __restrict__ hidden_states,
@@ -328,7 +440,8 @@ __global__ void kv_projection_kernel(
 
 __global__ void multi_head_attention_kernel(
         const fp_t* __restrict__ q,
-        const half* __restrict__ kv,
+        const half* __restrict__ k,
+        const half* __restrict__ v,
         fp_t* __restrict__ output,
         uint32_t batch_size,
         uint32_t seq_length,
@@ -347,7 +460,6 @@ __global__ void multi_head_attention_kernel(
 
     // Calculate dimensions
     uint32_t d_k = n_embd / n_head; // Dimension of each head
-    uint32_t kv_size = 2 * n_embd; // Size of Q, K, V for each token
 
     // Scores register
     fp_t scores[SEQ_LENGTH_MAX];
@@ -370,11 +482,10 @@ __global__ void multi_head_attention_kernel(
                              idx_seq * n_embd +
                              i_head * d_k +
                              d] *
-                           __half2float(kv[idx_batch * (seq_length + seq_offset) * kv_size +
-                                           j_token * kv_size +
-                                           0 * n_embd +
-                                           i_head * d_k +
-                                           d]);
+                           __half2float(k[idx_batch * (seq_length + seq_offset) * n_embd +
+                                          j_token * n_embd +
+                                          i_head * d_k +
+                                          d]);
                 }
                 scores[j_token] = dot * scale;
                 max_val = fmaxf(max_val, scores[j_token]);
@@ -403,11 +514,10 @@ __global__ void multi_head_attention_kernel(
             for (uint32_t j_token = 0; j_token < (seq_length + seq_offset); j_token++) {
                 // Get V values for token j_token, head i_head
                 weighted_sum += scores[j_token] *
-                                __half2float(kv[idx_batch * (seq_length + seq_offset) * kv_size +
-                                                j_token * kv_size +
-                                                1 * n_embd +
-                                                i_head * d_k +
-                                                d]);
+                                __half2float(v[idx_batch * (seq_length + seq_offset) * n_embd +
+                                               j_token * n_embd +
+                                               i_head * d_k +
+                                               d]);
             }
             // Use input as a temporary buffer to store head outputs
             output[idx_batch * seq_length * n_embd +

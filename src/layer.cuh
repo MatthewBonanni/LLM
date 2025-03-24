@@ -24,7 +24,6 @@ class Layer {
             uint32_t seq_offset);
         void load_from_hdf5(hid_t file_id, const std::string& layer_path);
         void copy_host_to_device();
-        void copy_device_to_host();
 
     private:
         void launch_layer_normalization(
@@ -71,36 +70,29 @@ class Layer {
         uint32_t n_head;
 
         // Attention
-        std::vector<fp_t> h_attn_c_attn_w_0;
-        std::vector<fp_t> h_attn_c_attn_b_0;
-        std::vector<fp_t> h_attn_c_proj_w_0;
-        std::vector<fp_t> h_attn_c_proj_b_0;
-        fp_t* d_attn_c_attn_w_0;
-        fp_t* d_attn_c_attn_b_0;
+        fp_t* d_attn_c_attn_w_Q_0;
+        fp_t* d_attn_c_attn_w_K_0;
+        fp_t* d_attn_c_attn_w_V_0;
+        fp_t* d_attn_c_attn_b_Q_0;
+        fp_t* d_attn_c_attn_b_K_0;
+        fp_t* d_attn_c_attn_b_V_0;
         fp_t* d_attn_c_proj_w_0;
         fp_t* d_attn_c_proj_b_0;
 
         // Layer normalization
-        std::vector<fp_t> h_ln_1_b_0;
-        std::vector<fp_t> h_ln_1_g_0;
-        std::vector<fp_t> h_ln_2_b_0;
-        std::vector<fp_t> h_ln_2_g_0;
         fp_t* d_ln_1_b_0;
         fp_t* d_ln_1_g_0;
         fp_t* d_ln_2_b_0;
         fp_t* d_ln_2_g_0;
 
         // MLP
-        std::vector<fp_t> h_mlp_c_fc_w_0;
-        std::vector<fp_t> h_mlp_c_fc_b_0;
-        std::vector<fp_t> h_mlp_c_proj_w_0;
-        std::vector<fp_t> h_mlp_c_proj_b_0;
         fp_t* d_mlp_c_fc_w_0;
         fp_t* d_mlp_c_fc_b_0;
         fp_t* d_mlp_c_proj_w_0;
         fp_t* d_mlp_c_proj_b_0;
 
         // KV cache
-        half* d_kv_cache;
+        half* d_k_cache;
+        half* d_v_cache;
         uint32_t kv_cache_size;
 };
