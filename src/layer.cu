@@ -155,10 +155,10 @@ void Layer::launch_multi_head_attention(
     dim3 grid_size((batch_size + block_size.x - 1) / block_size.x,
                    (seq_length + block_size.y - 1) / block_size.y,
                    1);
-    multi_head_attention_kernel<<<grid_size, block_size>>>(
-        d_q, d_k_cache, d_v_cache, d_output,
-        batch_size, seq_length, seq_offset, n_head, n_embd);
-    CHECK_CUDA(cudaGetLastError());
+    // multi_head_attention_kernel<<<grid_size, block_size>>>(
+    //     d_q, d_k_cache, d_v_cache, d_output,
+    //     batch_size, seq_length, seq_offset, n_head, n_embd);
+    // CHECK_CUDA(cudaGetLastError());
 }
 
 void Layer::launch_final_projection(
@@ -246,7 +246,7 @@ void Layer::apply(
     launch_qkv_projection(d_hidden_states, d_q, batch_size, seq_length, seq_offset);
 
     // Step 3.2: Multi-head attention
-    // launch_multi_head_attention(d_q, d_temp, batch_size, seq_length, seq_offset);
+    launch_multi_head_attention(d_q, d_temp, batch_size, seq_length, seq_offset);
 
     // Step 3.3: Final projection
     launch_final_projection(d_temp, d_hidden_states, batch_size, seq_length);
@@ -265,7 +265,7 @@ void Layer::apply(
     launch_layer_normalization(d_hidden_states, batch_size, seq_length);
 
     // Step 7: MLP (feedforward network)
-    launch_mlp(d_hidden_states, d_temp, batch_size, seq_length);
+    // launch_mlp(d_hidden_states, d_temp, batch_size, seq_length);
 
     // Step 8: Add residual connection
     launch_add_residual(d_temp, d_residual, d_hidden_states, batch_size, seq_length);

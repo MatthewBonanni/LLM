@@ -344,7 +344,7 @@ __global__ void kv_projection_kernel(
     const uint32_t warp_id = (threadIdx.y * blockDim.x + threadIdx.x) / WARP_SIZE;
     const uint32_t warp_m = warp_id / (BLOCK_M / WMMA_M);
     const uint32_t warp_n = warp_id % (BLOCK_M / WMMA_M);
-    const uint32_t batch_id = blockIdx.z * blockDim.z + threadIdx.z;
+    const uint32_t idx_batch = blockIdx.z * blockDim.z + threadIdx.z;
 
     // Block-level tile starting positions, index into the output matrix
     const uint32_t block_tile_m = blockIdx.y * BLOCK_M;
@@ -389,8 +389,8 @@ __global__ void kv_projection_kernel(
                 if ((block_tile_m + m_idx + seq_offset) < seq_length &&
                     (block_tile_k + k_idx) < n_embd) {
                     // Calculate global index for A (DxMxK, row-major)
-                    // A[batch_id][m][k] -> batch_id * (M * K) + m * (K) + k
-                    uint64_t global_idx = batch_id * seq_length * n_embd +
+                    // A[idx_batch][m][k] -> idx_batch * (M * K) + m * (K) + k
+                    uint64_t global_idx = idx_batch * seq_length * n_embd +
                                           (block_tile_m + m_idx + seq_offset) * n_embd +
                                           (block_tile_k + k_idx);
                     hidden_shared[m_idx * BLOCK_K + k_idx] = __float2half(hidden_states[global_idx]);
@@ -459,7 +459,7 @@ __global__ void kv_projection_kernel(
                 if ((warp_tile_m + m_idx + seq_offset) < seq_length &&
                     (warp_tile_n + n_idx) < n_embd) {
                     // Store the output in kv
-                    kv[batch_id * seq_length * n_embd +
+                    kv[idx_batch * seq_length * n_embd +
                        (warp_tile_m + m_idx + seq_offset) * n_embd +
                        (warp_tile_n + n_idx)] = __float2half(output[m_idx * BLOCK_N + n_idx]) +
                                                 __float2half(b_kv[warp_tile_n + n_idx]);
@@ -480,95 +480,160 @@ template __global__ void kv_projection_kernel<32, 32, 32>(
         uint32_t seq_offset,
         uint32_t n_embd);
 
-__global__ void multi_head_attention_kernel(
-        const fp_t* __restrict__ q,
-        const half* __restrict__ k,
-        const half* __restrict__ v,
-        fp_t* __restrict__ output,
-        uint32_t batch_size,
-        uint32_t seq_length,
-        uint32_t seq_offset,
-        uint32_t n_head,
-        uint32_t n_embd) {
-    // Calculate thread ID
-    uint32_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
+// __global__ void multi_head_attention_kernel(
+//         const fp_t* __restrict__ q,
+//         const half* __restrict__ k,
+//         const half* __restrict__ v,
+//         fp_t* __restrict__ output,
+//         uint32_t batch_size,
+//         uint32_t seq_length,
+//         uint32_t seq_offset,
+//         uint32_t n_head,
+//         uint32_t n_embd) {
+//     // Calculate indices
+//     const uint32_t idx_head = blockIdx.y;
+//     const uint32_t idx_seq = threadIdx.x;
+//     const uint32_t idx_batch = blockIdx.z * blockDim.z + threadIdx.z;
+//     const uint32_t lane_id = threadIdx.x % WARP_SIZE;
+//     const uint32_t thread_id = threadIdx.y * blockDim.x + threadIdx.x;
+//     const uint32_t warp_id = (threadIdx.y * blockDim.x + threadIdx.x) / WARP_SIZE;
 
-    // Check bounds
-    if (idx_batch >= batch_size ||
-        idx_seq   >= seq_length) {
-        return;
-    }
+//     const uint32_t warp_m = warp_id / (BLOCK_M / WMMA_M);
+//     const uint32_t warp_n = warp_id % (BLOCK_M / WMMA_M);
 
-    // Calculate dimensions
-    uint32_t d_k = n_embd / n_head; // Dimension of each head
+//     // Tensor Core matrices
+//     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+//     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
+//     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+    
+//     // Compute head-specific dimensions
+//     uint32_t d_k = n_embd / n_head;
+//     float scale = rsqrtf(d_k);
+    
+//     // Compute attention scores using Tensor Cores
+//     wmma::fill_fragment(c_frag, 0.0f);
+    
+//     // Parallel dot product computation using Tensor Cores
+//     for (uint32_t k_block = 0; k_block < d_k; k_block += WMMA_K) {
+//         // Load Q and K fragments
+//         wmma::load_matrix_sync(
+//             a_frag, 
+//             reinterpret_cast<const __half*>(q + idx_batch * seq_length * n_embd + 
+//                                             idx_seq * n_embd + 
+//                                             idx_head * d_k + 
+//                                             k_block), 
+//             n_embd);
+        
+//         wmma::load_matrix_sync(
+//             b_frag, 
+//             reinterpret_cast<const __half*>(k + idx_batch * (seq_length + seq_offset) * n_embd + 
+//                                             idx_seq * n_embd + 
+//                                             idx_head * d_k + 
+//                                             k_block), 
+//             n_embd);
+        
+//         // Perform matrix multiplication
+//         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+//     }
+    
+//     // Softmax computation with causal masking
+//     float local_score = (idx_seq <= blockIdx.z) ? c_frag.x[0] * scale : -INFINITY;
+    
+//     // Parallel reduction for max and sum
+//     __shared__ float s_max, s_sum;
+//     float thread_max = local_score;
+//     float thread_exp = (idx_seq <= blockIdx.z) ? expf(local_score) : 0.0f;
+    
+//     // Collaborative max reduction
 
-    // Scores register
-    fp_t scores[SEQ_LENGTH_MAX];
+//     // Reduction within the warp
+//     for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+//         thread_max = max(thread_max, __shfl_down_sync(0xffffffff, thread_max, offset));
+//     }
 
-    fp_t scale = rsqrtf(d_k);
+//     // First thread in the warp writes the result
+//     if (lane_id == 0) {
+//         s_max = thread_max;
+//     }
+//     __syncthreads();
 
-    // Process each attention head
-    for (uint32_t i_head = 0; i_head < n_head; i_head++) {
-        // Calculate attention scores between current token and all other tokens
-        fp_t max_val = -INFINITY;
-        for (uint32_t j_token = 0; j_token < (seq_length + seq_offset); j_token++) {
-            // Causal masking: only attend to positions j_token <= i_token
-            if (j_token <= idx_seq) {
-                // Compute dot product
-                fp_t dot = 0.0f;
-                for (uint32_t d = 0; d < d_k; d++) {
-                    // Q values for token idx_seq, head i_head
-                    // K values for token j_token, head i_head
-                    dot += q[idx_batch * seq_length * n_embd +
-                             idx_seq * n_embd +
-                             i_head * d_k +
-                             d] *
-                           __half2float(k[idx_batch * (seq_length + seq_offset) * n_embd +
-                                          j_token * n_embd +
-                                          i_head * d_k +
-                                          d]);
-                }
-                scores[j_token] = dot * scale;
-                max_val = fmaxf(max_val, scores[j_token]);
-            }
-        }
+//     // Final reduction across warps (done by first warp)
+//     if (warp_id == 0) {
+//         // Load 0 for lanes that would access out of bounds
+//         float warp_max = (lane_id < WARPS_PER_BLOCK) ? s_max : -INFINITY;
+        
+//         // Warp-level reduction again
+//         for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+//             warp_max = max(warp_max, __shfl_down_sync(0xffffffff, warp_max, offset));
+//         }
+        
+//         // First thread calculates final values
+//         if (lane_id == 0) {
+//             s_max = warp_max;
+//         }
+//     }
+//     __syncthreads();
+    
+//     // Exponential and sum reduction
+//     float exp_scaled = expf(local_score - s_max);
+//     float thread_sum = exp_scaled;
 
-        // Softmax calculation for attention weights
-        fp_t sum = 0.0f;
-        for (uint32_t j_token = 0; j_token < seq_length; j_token++) {
-            // Causal masking: masked tokens have zero weight
-            if (j_token <= idx_seq) {
-                scores[j_token] = expf(scores[j_token] - max_val);
-                sum += scores[j_token];
-            } else {
-                scores[j_token] = 0.0f;
-            }
-        }
+//     // Collaborative sum reduction
 
-        for (uint32_t j_token = 0; j_token < seq_length; j_token++) {
-            scores[j_token] /= sum;
-        }
+//     // Reduction within the warp
+//     for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+//         thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
+//     }
 
-        // Calculate weighted sum of values
-        for (uint32_t d = 0; d < d_k; d++) {
-            fp_t weighted_sum = 0.0f;
-            for (uint32_t j_token = 0; j_token < (seq_length + seq_offset); j_token++) {
-                // Get V values for token j_token, head i_head
-                weighted_sum += scores[j_token] *
-                                __half2float(v[idx_batch * (seq_length + seq_offset) * n_embd +
-                                               j_token * n_embd +
-                                               i_head * d_k +
-                                               d]);
-            }
-            // Use input as a temporary buffer to store head outputs
-            output[idx_batch * seq_length * n_embd +
-                   idx_seq * n_embd +
-                   i_head * d_k +
-                   d] = weighted_sum;
-        }
-    }
-}
+//     // First thread in the warp writes the result
+//     if (lane_id == 0) {
+//         s_sum = thread_sum;
+//     }
+//     __syncthreads();
+
+//     // Final reduction across warps (done by first warp)
+//     if (warp_id == 0) {
+//         // Load 0 for lanes that would access out of bounds
+//         float warp_sum = (lane_id < WARPS_PER_BLOCK) ? s_sum : 0.0f;
+        
+//         // Warp-level reduction again
+//         for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+//             warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+//         }
+        
+//         // First thread calculates final values
+//         if (lane_id == 0) {
+//             s_sum = warp_sum;
+//         }
+//     }
+//     __syncthreads();
+
+//     // Final output computation with values
+//     float attention_weight = (idx_seq <= blockIdx.z) ? exp_scaled / s_sum : 0.0f;
+    
+//     // Compute weighted sum of values using Tensor Cores
+//     wmma::fill_fragment(a_frag, attention_weight);
+//     wmma::fill_fragment(c_frag, 0.0f);
+    
+//     for (uint32_t k_block = 0; k_block < d_k; k_block += WMMA_K) {
+//         // Load V fragment
+//         wmma::load_matrix_sync(
+//             b_frag,
+//             reinterpret_cast<const __half*>(v + idx_batch * (seq_length + seq_offset) * n_embd + 
+//                                             idx_seq * n_embd + 
+//                                             idx_head * d_k + 
+//                                             k_block), 
+//             n_embd);
+        
+//         // Perform weighted value accumulation
+//         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+//     }
+    
+//     // Store result
+//     output[idx_batch * seq_length * n_embd +
+//            idx_seq * n_embd +
+//            idx_head * d_k] = c_frag.x[0];
+// }
 
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
 __global__ void final_projection_kernel(
@@ -585,7 +650,7 @@ __global__ void final_projection_kernel(
     const uint32_t warp_id = (threadIdx.y * blockDim.x + threadIdx.x) / WARP_SIZE;
     const uint32_t warp_m = warp_id / (BLOCK_M / WMMA_M);
     const uint32_t warp_n = warp_id % (BLOCK_M / WMMA_M);
-    const uint32_t batch_id = blockIdx.z * blockDim.z + threadIdx.z;
+    const uint32_t idx_batch = blockIdx.z * blockDim.z + threadIdx.z;
 
     // Block-level tile starting positions, index into the output matrix
     const uint32_t block_tile_m = blockIdx.y * BLOCK_M;
@@ -630,8 +695,8 @@ __global__ void final_projection_kernel(
                 if ((block_tile_m + m_idx) < seq_length &&
                     (block_tile_k + k_idx) < n_embd) {
                     // Calculate global index for A (DxMxK, row-major)
-                    // A[batch_id][m][k] -> batch_id * (M * K) + m * (K) + k
-                    uint64_t global_idx = batch_id * seq_length * n_embd +
+                    // A[idx_batch][m][k] -> idx_batch * (M * K) + m * (K) + k
+                    uint64_t global_idx = idx_batch * seq_length * n_embd +
                                           (block_tile_m + m_idx) * n_embd +
                                           (block_tile_k + k_idx);
                     input_shared[m_idx * BLOCK_K + k_idx] = __float2half(input[global_idx]);
@@ -813,6 +878,7 @@ __global__ void mlp_kernel(
     }
 }
 
+template <uint32_t BLOCK_SIZE, uint32_t WARPS_PER_BLOCK>
 __global__ void lm_head_kernel(
         const fp_t* __restrict__ hidden_state,
         fp_t* __restrict__ logits,
@@ -822,12 +888,13 @@ __global__ void lm_head_kernel(
         uint32_t seq_length,
         uint32_t n_vocab,
         uint32_t n_embd) {
-    // TODO: Reduction operators shfl_down_sync
-    // TODO: Shared memory for partial results
-    // TODO: Grouped reads
     // Calculate thread ID
-    uint32_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t idx_vocab = blockIdx.y * blockDim.y + threadIdx.y;
+    const uint32_t idx_batch = blockIdx.x;
+    const uint32_t idx_vocab = blockIdx.y;
+    const uint32_t tidx = threadIdx.x;
+    const uint32_t lane_id = tidx % WARP_SIZE;
+    const uint32_t warp_id = tidx / WARP_SIZE;
+    
 
     // Check bounds
     if (idx_batch >= batch_size ||
@@ -842,9 +909,60 @@ __global__ void lm_head_kernel(
     uint64_t offset_input =  ((uint64_t)idx_batch * seq_length + (seq_length - 1)) * n_embd;
     uint64_t offset_weights = (uint64_t)idx_vocab * n_embd;
 
-    // Compute logits
-    logits[idx_out] = biases ? biases[idx_vocab] : 0.0f;
-    for (uint32_t i = 0; i < n_embd; i++) {
-        logits[idx_out] += hidden_state[offset_input + i] * weights[offset_weights + i];
+    // Shared memory for partial sums
+    __shared__ float s_sums[WARPS_PER_BLOCK];
+
+    // Local accumulator
+    fp_t sum = biases ? biases[idx_vocab] : 0.0f;
+
+    // Calculate local sum (with coalesced memory access)
+    #pragma unroll
+    for (uint32_t i = tidx * 4; i < n_embd; i += BLOCK_SIZE * 4) {
+        float4 hidden_vec = *reinterpret_cast<const float4*>(&hidden_state[offset_input + i]);
+        float4 weight_vec = *reinterpret_cast<const float4*>(&weights[offset_weights + i]);
+
+        sum += hidden_vec.x * weight_vec.x +
+               hidden_vec.y * weight_vec.y +
+               hidden_vec.z * weight_vec.z +
+               hidden_vec.w * weight_vec.w;
+    }
+
+    // Warp-level reduction
+    #pragma unroll
+    for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+
+    // First thread in the warp writes the result
+    if (lane_id == 0) {
+        s_sums[warp_id] = sum;
+    }
+    __syncthreads();
+
+    // Final reduction across warps (done by first warp)
+    if (warp_id == 0) {
+        // Load 0 for lanes that would access out of bounds
+        float warp_sum = (lane_id < WARPS_PER_BLOCK) ? s_sums[lane_id] : 0.0f;
+        
+        // Warp-level reduction again
+        for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+            warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+        }
+        
+        // First thread calculates final values
+        if (lane_id == 0) {
+            logits[idx_out] = warp_sum;
+        }
     }
 }
+
+// Explicit instantiation
+template __global__ void lm_head_kernel<256, 8>(
+        const fp_t* __restrict__ hidden_state,
+        fp_t* __restrict__ logits,
+        const fp_t* __restrict__ weights,
+        const fp_t* __restrict__ biases,
+        uint32_t batch_size,
+        uint32_t seq_length,
+        uint32_t n_vocab,
+        uint32_t n_embd);

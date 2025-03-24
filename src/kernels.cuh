@@ -55,16 +55,16 @@ __global__ void kv_projection_kernel(
     uint32_t seq_offset,
     uint32_t n_embd);
 
-__global__ void multi_head_attention_kernel(
-    const fp_t* __restrict__ q,
-    const half* __restrict__ k,
-    const half* __restrict__ v,
-    fp_t* __restrict__ output,
-    uint32_t batch_size,
-    uint32_t seq_length,
-    uint32_t seq_offset,
-    uint32_t n_head,
-    uint32_t n_embd);
+// __global__ void multi_head_attention_kernel(
+//     const fp_t* __restrict__ q,
+//     const half* __restrict__ k,
+//     const half* __restrict__ v,
+//     fp_t* __restrict__ output,
+//     uint32_t batch_size,
+//     uint32_t seq_length,
+//     uint32_t seq_offset,
+//     uint32_t n_head,
+//     uint32_t n_embd);
 
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
 __global__ void final_projection_kernel(
@@ -96,6 +96,7 @@ __global__ void mlp_kernel(
     uint32_t seq_length,
     uint32_t n_embd);
 
+template <uint32_t BLOCK_SIZE, uint32_t WARPS_PER_BLOCK>
 __global__ void lm_head_kernel(
     const fp_t* __restrict__ hidden_state,
     fp_t* __restrict__ logits,

@@ -179,9 +179,9 @@ void LLM::launch_lm_head(fp_t* d_hidden_state,
     // GPT-2 uses wte as the lm_head
     // Each block handles one token (i_batch, i_vocab)
     // in the logits (batch, vocab)
-    dim3 block_size(128, 1, 1);
+    dim3 block_size(256, 1, 1);
     dim3 grid_size(batch_size, n_vocab, 1);
-    lm_head_kernel<<<grid_size, block_size>>>(
+    lm_head_kernel<256, 8><<<grid_size, block_size>>>(
         d_hidden_state, d_logits, d_wte_0, nullptr,
         batch_size, seq_length, n_vocab, n_embd);
     CHECK_CUDA(cudaGetLastError());
