@@ -102,54 +102,23 @@ void Layer::launch_qkv_projection(
         uint32_t batch_size,
         uint32_t seq_length,
         uint32_t seq_offset) {
-    constexpr uint32_t BLOCK_M = 16;
-    constexpr uint32_t BLOCK_N = 16;
-    constexpr uint32_t BLOCK_K = 16;
+    constexpr uint32_t BLOCK_M = 32;
+    constexpr uint32_t BLOCK_N = 32;
+    constexpr uint32_t BLOCK_K = 32;
     constexpr uint32_t WARPS_PER_BLOCK = (BLOCK_M/WMMA_M * BLOCK_N/WMMA_N);
     dim3 grid_size_q(((n_embd     + BLOCK_N - 1) / BLOCK_N),
                      ((batch_size + BLOCK_M - 1) / BLOCK_M),
                      1);
     dim3 block_size_q(WARP_SIZE, WARPS_PER_BLOCK, 1);
-    uint32_t shared_mem_size_q = (BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N) * sizeof(half);
+    uint32_t shared_mem_size_q = std::max(
+        (BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N) * sizeof(half),
+        (BLOCK_M * BLOCK_N) * sizeof(fp_t));
     q_projection_kernel<BLOCK_M, BLOCK_N, BLOCK_K><<<grid_size_q, block_size_q, shared_mem_size_q>>>(
         d_hidden_states, d_q,
         d_attn_c_attn_w_Q_0, d_attn_c_attn_b_Q_0,
         batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
 
-    // DEBUG
-    std::vector<fp_t> h_hidden_states(batch_size * seq_length * n_embd);
-    CHECK_CUDA(cudaMemcpy(
-        h_hidden_states.data(),
-        d_hidden_states,
-        (uint64_t)batch_size * seq_length * n_embd * sizeof(fp_t),
-        cudaMemcpyDeviceToHost));
-    std::cout << "Hidden states:" << std::endl;
-    for (uint32_t i = 0; i < batch_size; i++) {
-        for (uint32_t j = 0; j < seq_length; j++) {
-            for (uint32_t k = 0; k < 5; k++) {
-                std::cout << h_hidden_states[(uint64_t)i * seq_length * n_embd + (uint64_t)j * n_embd + k] << " ";
-            }
-            std::cout << std::endl;
-        }
-    }
-    std::cout << std::endl;
-
-    std::vector<fp_t> h_q(batch_size * n_embd);
-    CHECK_CUDA(cudaMemcpy(
-        h_q.data(),
-        d_q,
-        (uint64_t)batch_size * n_embd * sizeof(fp_t),
-        cudaMemcpyDeviceToHost));
-    std::cout << "Q:" << std::endl;
-    for (uint32_t i = 0; i < batch_size; i++) {
-        for (uint32_t j = 0; j < 5; j++) {
-            std::cout << h_q[(uint64_t)i * n_embd + j] << " ";
-        }
-        std::cout << std::endl;
-    }
-    exit(0);
-    
     // dim3 block_size_kv(32, 16, 1);
     // dim3 grid_size_kv(1,
     //                   (seq_length + block_size_kv.y - 1) / block_size_kv.y,
