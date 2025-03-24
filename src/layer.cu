@@ -102,34 +102,83 @@ void Layer::launch_qkv_projection(
         uint32_t batch_size,
         uint32_t seq_length,
         uint32_t seq_offset) {
-    constexpr uint32_t BLOCK_M = 32;
-    constexpr uint32_t BLOCK_N = 32;
-    constexpr uint32_t BLOCK_K = 32;
-    constexpr uint32_t WARPS_PER_BLOCK = (BLOCK_M/WMMA_M * BLOCK_N/WMMA_N);
-    dim3 grid_size_q(((n_embd     + BLOCK_N - 1) / BLOCK_N),
-                     ((batch_size + BLOCK_M - 1) / BLOCK_M),
+    // dim3 block_size_q(32, 32, 1);
+    // dim3 grid_size_q(1,
+    //                  (seq_length + block_size_q.y - 1) / block_size_q.y,
+    //                  batch_size);
+    // size_t shared_mem_size_q = (WMMA_M * n_embd + WMMA_M * WMMA_K) * sizeof(half);
+    // q_projection_kernel<<<grid_size_q, block_size_q, shared_mem_size_q>>>(
+    //     d_hidden_states, d_q,
+    //     d_attn_c_attn_w_Q_0, d_attn_c_attn_b_Q_0,
+    //     batch_size, seq_length, n_embd);
+    // CHECK_CUDA(cudaGetLastError());
+
+    constexpr uint32_t BLOCK_M_Q = 32;
+    constexpr uint32_t BLOCK_N_Q = 32;
+    constexpr uint32_t BLOCK_K_Q = 32;
+    constexpr uint32_t WARPS_PER_BLOCK_Q = (BLOCK_M_Q/WMMA_M * BLOCK_N_Q/WMMA_N);
+    dim3 grid_size_q(((n_embd     + BLOCK_N_Q - 1) / BLOCK_N_Q),
+                     ((batch_size + BLOCK_M_Q - 1) / BLOCK_M_Q),
                      1);
-    dim3 block_size_q(WARP_SIZE, WARPS_PER_BLOCK, 1);
-    uint32_t shared_mem_size_q = std::max(
-        (BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N) * sizeof(half),
-        (BLOCK_M * BLOCK_N) * sizeof(fp_t));
-    q_projection_kernel<BLOCK_M, BLOCK_N, BLOCK_K><<<grid_size_q, block_size_q, shared_mem_size_q>>>(
+    dim3 block_size_q(WARP_SIZE, WARPS_PER_BLOCK_Q, 1);
+    uint32_t shared_mem_size_q = (BLOCK_M_Q * BLOCK_K_Q + BLOCK_K_Q * BLOCK_N_Q) * sizeof(half);
+    q_projection_kernel<BLOCK_M_Q, BLOCK_N_Q, BLOCK_K_Q><<<grid_size_q, block_size_q, shared_mem_size_q>>>(
         d_hidden_states, d_q,
         d_attn_c_attn_w_Q_0, d_attn_c_attn_b_Q_0,
         batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
 
-    // dim3 block_size_kv(32, 16, 1);
-    // dim3 grid_size_kv(1,
-    //                   (seq_length + block_size_kv.y - 1) / block_size_kv.y,
-    //                   batch_size);
-    // size_t shared_mem_size_kv = (WMMA_M * n_embd + 2 * WMMA_M * WMMA_K) * sizeof(half);
-    // fp_t* w_kv = d_attn_c_attn_w_0 + n_embd * n_embd;
-    // fp_t* b_kv = d_attn_c_attn_b_0 + n_embd;
-    // kv_projection_kernel<<<grid_size_kv, block_size_kv, shared_mem_size_kv>>>(
-    //     d_hidden_states, d_kv_cache, w_kv, b_kv,
-    //     batch_size, seq_length, seq_offset, n_embd);
-    // CHECK_CUDA(cudaGetLastError());
+    // DEBUG
+    std::vector<fp_t> h_q(batch_size * n_embd);
+    CHECK_CUDA(cudaMemcpy(h_q.data(), d_q, batch_size * n_embd * sizeof(fp_t), cudaMemcpyDeviceToHost));
+    std::cout << "Q: " << std::endl;
+    for (uint32_t i = 0; i < batch_size; i++) {
+        for (uint32_t j = 0; j < 5; j++) {
+            std::cout << h_q[i * n_embd + j] << " ";
+        }
+        std::cout << std::endl;
+    }
+    std::cout << "------------------" << std::endl;
+
+
+    constexpr uint32_t BLOCK_M_KV = 32;
+    constexpr uint32_t BLOCK_N_KV = 32;
+    constexpr uint32_t BLOCK_K_KV = 32;
+    constexpr uint32_t WARPS_PER_BLOCK_KV = (BLOCK_M_KV/WMMA_M * BLOCK_N_KV/WMMA_N);
+    dim3 grid_size_kv(((n_embd     + BLOCK_N_KV - 1) / BLOCK_N_KV),
+                      ((seq_length + BLOCK_M_KV - 1) / BLOCK_M_KV),
+                      batch_size);
+    dim3 block_size_kv(WARP_SIZE, WARPS_PER_BLOCK_KV, 1);
+    uint32_t shared_mem_size_kv = std::max(
+        (BLOCK_M_KV * BLOCK_K_KV + BLOCK_K_KV * BLOCK_N_KV) * sizeof(half),
+        (BLOCK_M_KV * BLOCK_N_KV) * sizeof(fp_t));
+    kv_projection_kernel<BLOCK_M_KV, BLOCK_N_KV, BLOCK_K_KV><<<grid_size_kv, block_size_kv, shared_mem_size_kv>>>(
+        d_hidden_states, d_k_cache,
+        d_attn_c_attn_w_K_0, d_attn_c_attn_b_K_0,
+        batch_size, seq_length, seq_offset, n_embd);
+    CHECK_CUDA(cudaGetLastError());
+    kv_projection_kernel<BLOCK_M_KV, BLOCK_N_KV, BLOCK_K_KV><<<grid_size_kv, block_size_kv, shared_mem_size_kv>>>(
+        d_hidden_states, d_v_cache,
+        d_attn_c_attn_w_V_0, d_attn_c_attn_b_V_0,
+        batch_size, seq_length, seq_offset, n_embd);
+    CHECK_CUDA(cudaGetLastError());
+
+    // DEBUG
+    std::vector<fp_t> h_k(batch_size * seq_length * n_embd);
+    CHECK_CUDA(cudaMemcpy(h_k.data(), d_k_cache, batch_size * seq_length * n_embd * sizeof(half), cudaMemcpyDeviceToHost));
+    std::cout << "seq_length: " << seq_length << std::endl;
+    std::cout << "seq_offset: " << seq_offset << std::endl;
+    std::cout << "K cache: " << std::endl;
+    for (uint32_t i = 0; i < batch_size; i++) {
+        for (uint32_t j = 0; j < seq_length; j++) {
+            for (uint32_t k = 0; k < 5; k++) {
+                std::cout << h_k[i * seq_length * n_embd + (j + seq_offset) * n_embd + k] << " ";
+            }
+            std::cout << std::endl;
+        }
+        std::cout << "------------------" << std::endl;
+    }
+    exit(0);
 }
 
 void Layer::launch_multi_head_attention(
@@ -174,12 +223,10 @@ void Layer::launch_add_residual(
         fp_t* d_output,
         uint32_t batch_size,
         uint32_t seq_length) {
-    // Each thread handles one token (i_batch, i_sequence, :)
+    // Each block handles one token (i_batch, i_sequence, :)
     // in the hidden states (batch, sequence, embedding)
-    dim3 block_size(32, 32, 1);
-    dim3 grid_size((batch_size + block_size.x - 1) / block_size.x,
-                   (seq_length + block_size.y - 1) / block_size.y,
-                   1);
+    dim3 block_size(128, 1, 1);
+    dim3 grid_size(batch_size, seq_length, 1);
     add_residual_kernel<<<grid_size, block_size>>>(
         d_input, d_residual, d_output,
         batch_size, seq_length, n_embd);

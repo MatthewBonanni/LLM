@@ -177,14 +177,10 @@ void LLM::launch_lm_head(fp_t* d_hidden_state,
                          fp_t* d_logits,
                          uint32_t seq_length) {
     // GPT-2 uses wte as the lm_head
-    // Each thread handles one element (i_batch, i_vocab)
+    // Each block handles one token (i_batch, i_vocab)
     // in the logits (batch, vocab)
-    dim3 block_size(std::min(batch_size, (uint32_t)32),
-                    std::min(n_vocab,    (uint32_t)32),
-                    1);
-    dim3 grid_size((batch_size + block_size.x - 1) / block_size.x,
-                   (n_vocab    + block_size.y - 1) / block_size.y,
-                   1);
+    dim3 block_size(128, 1, 1);
+    dim3 grid_size(batch_size, n_vocab, 1);
     lm_head_kernel<<<grid_size, block_size>>>(
         d_hidden_state, d_logits, d_wte_0, nullptr,
         batch_size, seq_length, n_vocab, n_embd);
