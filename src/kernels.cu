@@ -45,31 +45,19 @@ __global__ void embedding_kernel(
     const uint64_t wte_offset = (uint64_t)token_id * n_embd;
     const uint64_t wpe_offset = ((uint64_t)idx_seq + seq_offset) * n_embd;
     
-    // Iterate over the embedding dimension in chunks of 8
+    // Iterate over the embedding dimension in chunks of 4
     #pragma unroll
-    for (uint32_t i = tidx * 8; i < n_embd; i += BLOCK_SIZE * 8) {
-        // Load first 4 elements
-        const float4 wte_vec1 = *reinterpret_cast<const float4*>(&wte[wte_offset + i]);
-        const float4 wpe_vec1 = *reinterpret_cast<const float4*>(&wpe[wpe_offset + i]);
+    for (uint32_t i = tidx * 4; i < n_embd; i += BLOCK_SIZE * 4) {
+        // Load 4 elements from wte and wpe
+        const float4 wte_vec = *reinterpret_cast<const float4*>(&wte[wte_offset + i]);
+        const float4 wpe_vec = *reinterpret_cast<const float4*>(&wpe[wpe_offset + i]);
         
-        // Load next 4 elements
-        const float4 wte_vec2 = *reinterpret_cast<const float4*>(&wte[wte_offset + i + 4]);
-        const float4 wpe_vec2 = *reinterpret_cast<const float4*>(&wpe[wpe_offset + i + 4]);
-        
-        // Store first 4 elements
+        // Sum the two vectors
         *reinterpret_cast<float4*>(&embeddings[out_offset + i]) = make_float4(
-            wte_vec1.x + wpe_vec1.x,
-            wte_vec1.y + wpe_vec1.y,
-            wte_vec1.z + wpe_vec1.z,
-            wte_vec1.w + wpe_vec1.w
-        );
-        
-        // Store next 4 elements
-        *reinterpret_cast<float4*>(&embeddings[out_offset + i + 4]) = make_float4(
-            wte_vec2.x + wpe_vec2.x,
-            wte_vec2.y + wpe_vec2.y,
-            wte_vec2.z + wpe_vec2.z,
-            wte_vec2.w + wpe_vec2.w
+            wte_vec.x + wpe_vec.x,
+            wte_vec.y + wpe_vec.y,
+            wte_vec.z + wpe_vec.z,
+            wte_vec.w + wpe_vec.w
         );
     }
 }
@@ -613,6 +601,7 @@ __global__ void final_projection_kernel(
     }
 }
 
+template <uint32_t BLOCK_SIZE>
 __global__ void add_residual_kernel(
         const fp_t* __restrict__ input,
         const fp_t* __restrict__ residual,
@@ -621,8 +610,9 @@ __global__ void add_residual_kernel(
         uint32_t seq_length,
         uint32_t n_embd) {
     // Calculate thread ID
-    uint32_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
+    const uint32_t idx_batch = blockIdx.x;
+    const uint32_t idx_seq = blockIdx.y;
+    const uint32_t tidx = threadIdx.x;
 
     // Check bounds
     if (idx_batch >= batch_size ||
@@ -631,13 +621,33 @@ __global__ void add_residual_kernel(
     }
 
     // Get the starting index for the current token
-    uint64_t offset = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
+    const uint64_t offset = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
 
-    // Add residual connection
-    for (uint32_t i = 0; i < n_embd; i++) {
-        output[offset + i] = input[offset + i] + residual[offset + i];
+    // Iterate over the embedding dimension in chunks of 4
+    #pragma unroll
+    for (uint32_t i = tidx * 4; i < n_embd; i += BLOCK_SIZE * 4) {
+        // Load 4 elements from input and residual
+        float4 input_vec = *reinterpret_cast<const float4*>(&input[offset + i]);
+        float4 residual_vec = *reinterpret_cast<const float4*>(&residual[offset + i]);
+
+        // Add residual
+        *reinterpret_cast<float4*>(&output[offset + i]) = make_float4(
+            input_vec.x + residual_vec.x,
+            input_vec.y + residual_vec.y,
+            input_vec.z + residual_vec.z,
+            input_vec.w + residual_vec.w
+        );
     }
 }
+
+// Explicit instantiation
+template __global__ void add_residual_kernel<128>(
+        const fp_t* __restrict__ input,
+        const fp_t* __restrict__ residual,
+        fp_t* __restrict__ output,
+        uint32_t batch_size,
+        uint32_t seq_length,
+        uint32_t n_embd);
 
 __global__ void mlp_kernel(
         const fp_t* __restrict__ input,

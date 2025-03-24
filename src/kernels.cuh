@@ -75,6 +75,7 @@ __global__ void final_projection_kernel(
     uint32_t seq_length,
     uint32_t n_embd);
 
+template <uint32_t BLOCK_SIZE>
 __global__ void add_residual_kernel(
     const fp_t* __restrict__ input,
     const fp_t* __restrict__ residual,

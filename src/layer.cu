@@ -186,7 +186,7 @@ void Layer::launch_add_residual(
     // in the hidden states (batch, sequence, embedding)
     dim3 block_size(128, 1, 1);
     dim3 grid_size(batch_size, seq_length, 1);
-    add_residual_kernel<<<grid_size, block_size>>>(
+    add_residual_kernel<128><<<grid_size, block_size>>>(
         d_input, d_residual, d_output,
         batch_size, seq_length, n_embd);
     CHECK_CUDA(cudaGetLastError());
@@ -237,7 +237,7 @@ void Layer::apply(
     launch_qkv_projection(d_hidden_states, d_q, batch_size, seq_length, seq_offset);
 
     // Step 3.2: Multi-head attention
-    launch_multi_head_attention(d_q, d_temp, batch_size, seq_length, seq_offset);
+    // launch_multi_head_attention(d_q, d_temp, batch_size, seq_length, seq_offset);
 
     // Step 3.3: Final projection
     launch_final_projection(d_temp, d_hidden_states, batch_size, seq_length);
