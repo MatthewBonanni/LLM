@@ -34,7 +34,7 @@ __global__ void layer_normalization_kernel(
     uint32_t seq_length,
     uint32_t n_embd);
 
-template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
+// template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
 __global__ void q_projection_kernel(
     const fp_t* __restrict__ hidden_states,
     fp_t* __restrict__ q,
@@ -44,12 +44,12 @@ __global__ void q_projection_kernel(
     uint32_t seq_length,
     uint32_t n_embd);
 
-template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
+// template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
 __global__ void kv_projection_kernel(
     const fp_t* __restrict__ hidden_states,
     half* __restrict__ kv,
-    const fp_t* __restrict__ w_qkv,
-    const fp_t* __restrict__ b_qkv,
+    const fp_t* __restrict__ w_kv,
+    const fp_t* __restrict__ b_kv,
     uint32_t batch_size,
     uint32_t seq_length,
     uint32_t seq_offset,

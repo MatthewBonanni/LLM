@@ -195,37 +195,6 @@ template __global__ void layer_normalization_kernel<256, 8>(
         uint32_t seq_length,
         uint32_t n_embd);
 
-// __global__ void q_projection_kernel(
-//         const fp_t* __restrict__ hidden_states,
-//         fp_t* __restrict__ q,
-//         const fp_t* __restrict__ w_q,
-//         const fp_t* __restrict__ b_q,
-//         uint32_t batch_size,
-//         uint32_t seq_length,
-//         uint32_t n_embd) {
-//     // Calculate batch and embedding indices
-//     uint32_t idx_batch = blockIdx.x * blockDim.x + threadIdx.x;
-//     uint32_t idx_embd = blockIdx.y * blockDim.y + threadIdx.y;
-
-//     // Check bounds
-//     if (idx_batch >= batch_size ||
-//         idx_embd  >= n_embd) {
-//         return;
-//     }
-
-//     // Calculate memory offsets
-//     uint64_t hidden_offset = ((uint64_t)idx_batch * seq_length + (seq_length - 1)) * n_embd;
-//     uint64_t q_offset = (uint64_t)idx_batch * n_embd;
-
-//     // Perform Q projection
-//     float val = b_q[idx_embd];
-//     for (uint32_t i = 0; i < n_embd; i++) {
-//         val += hidden_states[hidden_offset + i] * w_q[i + n_embd * idx_embd];
-//     }
-//     q[q_offset + idx_embd] = val;
-// }
-
-template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
 __global__ void q_projection_kernel(
         const fp_t* __restrict__ hidden_states,
         fp_t* __restrict__ q,
@@ -234,143 +203,173 @@ __global__ void q_projection_kernel(
         uint32_t batch_size,
         uint32_t seq_length,
         uint32_t n_embd) {
-    // Warp index within the block
-    const uint32_t thread_id = threadIdx.y * blockDim.x + threadIdx.x;
-    const uint32_t threads_per_block = blockDim.x * blockDim.y;
-    const uint32_t warp_id = (threadIdx.y * blockDim.x + threadIdx.x) / WARP_SIZE;
-    const uint32_t warp_m = warp_id / (BLOCK_M / WMMA_M);
-    const uint32_t warp_n = warp_id % (BLOCK_M / WMMA_M);
+    // Calculate batch and embedding indices
+    uint32_t idx_embd  = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t idx_batch = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Block-level tile starting positions, index into the output matrix
-    const uint32_t block_tile_m = blockIdx.y * BLOCK_M;
-    const uint32_t block_tile_n = blockIdx.x * BLOCK_N;
-
-    // Warp-level tile starting positions, index into the output matrix
-    const uint32_t warp_tile_m = block_tile_m + warp_m * WMMA_M;
-    const uint32_t warp_tile_n = block_tile_n + warp_n * WMMA_N;
-
-    // How many elements each thread will load into shared memory
-    // from A (hidden_states) and B (w_q)
-    const uint32_t A_elements_per_thread = (BLOCK_M * BLOCK_K + threads_per_block - 1) / threads_per_block;
-    const uint32_t B_elements_per_thread = (BLOCK_K * BLOCK_N + threads_per_block - 1) / threads_per_block;
-    const uint32_t C_elements_per_thread = (BLOCK_M * BLOCK_N + threads_per_block - 1) / threads_per_block;
-
-    // Define shared memory for A and B tiles
-    extern __shared__ half smem[];
-    half* hidden_shared = &smem[0];
-    half* w_q_shared = &smem[BLOCK_M * BLOCK_K];
-
-    // Declare the fragments
-    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-
-    // Initialize the accumulator fragment with zeros
-    wmma::fill_fragment(c_frag, 0.0f);
-
-    // Loop over k dimension
-    for (uint32_t block_tile_k = 0; block_tile_k < n_embd; block_tile_k += BLOCK_K) {
-        // Load A (hidden_states) from global to shared memory
-        for (uint32_t i = 0; i < A_elements_per_thread; i++) {
-            uint32_t element_id = thread_id + i * threads_per_block;
-            if (element_id < BLOCK_M * BLOCK_K) {
-                uint32_t m_idx = element_id / BLOCK_K;
-                uint32_t k_idx = element_id % BLOCK_K;
-                
-                // Check bounds
-                if ((block_tile_m + m_idx) < batch_size &&
-                    (block_tile_k + k_idx) < n_embd) {
-                    // Calculate global index for A (MxDxK, row-major)
-                    // A[m][d_idx][k] -> m * (D * K) + d_idx * K + k
-                    uint64_t global_idx = (block_tile_m + m_idx) * seq_length * n_embd +
-                                          (seq_length - 1) * n_embd +
-                                          (block_tile_k + k_idx);
-                    hidden_shared[m_idx * BLOCK_K + k_idx] = __float2half(hidden_states[global_idx]);
-                } else {
-                    hidden_shared[m_idx * BLOCK_K + k_idx] = __float2half(0.0f);
-                }
-            }
-        }
-
-        // Load B (w_q) from global to shared memory
-        for (uint32_t i = 0; i < B_elements_per_thread; i++) {
-            uint32_t element_id = thread_id + i * threads_per_block;
-            if (element_id < BLOCK_K * BLOCK_N) {
-                uint32_t k_idx = element_id % BLOCK_K;
-                uint32_t n_idx = element_id / BLOCK_K;
-                
-                // Check bounds
-                if ((block_tile_k + k_idx) < n_embd && (block_tile_n + n_idx) < n_embd) {
-                    // Calculate global index for B (KxN, column-major)
-                    // B[k][n] -> k + K * n
-                    uint32_t global_idx = (block_tile_k + k_idx) + n_embd * (block_tile_n + n_idx);
-                    w_q_shared[k_idx + BLOCK_K * n_idx] = __float2half(w_q[global_idx]);
-                } else {
-                    w_q_shared[k_idx + BLOCK_K * n_idx] = __float2half(0.0f);
-                }
-            }
-        }
-
-        __syncthreads();
-
-        // Loop over the shared tile with tensor core operations
-        for (uint32_t k_warp = 0; k_warp < BLOCK_K; k_warp += WMMA_K) {
-            // Load A and B from shared memory into fragments
-            uint32_t a_row = warp_m * WMMA_M;
-            uint32_t a_col = k_warp;
-            uint32_t b_row = k_warp;
-            uint32_t b_col = warp_n * WMMA_N;
-            
-            // Load matrix fragments from shared memory
-            wmma::load_matrix_sync(a_frag, &hidden_shared[a_row * BLOCK_K + a_col], BLOCK_K);
-            wmma::load_matrix_sync(b_frag, &w_q_shared[b_row + BLOCK_K * b_col], BLOCK_K);
-            
-            // Perform matrix multiplication
-            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-        }
-
-        // Ensure all warps have finished using shared memory
-        __syncthreads();
+    // Check bounds
+    if (idx_embd  >= n_embd ||
+        idx_batch >= batch_size) {
+        return;
     }
 
-    // Store the output
-    if (warp_tile_m < batch_size && warp_tile_n < n_embd) {
-        wmma::store_matrix_sync(
-            &q[warp_tile_m * n_embd + warp_tile_n],
-            c_frag,
-            n_embd,
-            wmma::mem_row_major);
-        
-        // Add bias
-        for (uint32_t i = 0; i < C_elements_per_thread; i++) {
-            uint32_t element_id = thread_id + i * threads_per_block;
-            if (element_id < BLOCK_M * BLOCK_N) {
-                uint32_t m_idx = element_id / BLOCK_N;
-                uint32_t n_idx = element_id % BLOCK_N;
+    // Calculate memory offsets
+    uint64_t hidden_offset = ((uint64_t)idx_batch * seq_length + (seq_length - 1)) * n_embd;
+    uint64_t q_offset = (uint64_t)idx_batch * n_embd;
 
-                // Check bounds
-                if ((warp_tile_m + m_idx) < batch_size &&
-                    (warp_tile_n + n_idx) < n_embd) {
-                    // Store the output in q
-                    q[(warp_tile_m + m_idx) * n_embd +
-                      (warp_tile_n + n_idx)] += b_q[warp_tile_n + n_idx];
-                }
-            }
-        }
+    // Perform Q projection
+    float val = b_q[idx_embd];
+    for (uint32_t i = 0; i < n_embd; i++) {
+        val += hidden_states[hidden_offset + i] * w_q[i + n_embd * idx_embd];
     }
+    q[q_offset + idx_embd] = val;
 }
 
-// Explicit instantiation
-template __global__ void q_projection_kernel<32, 32, 32>(
-        const fp_t* __restrict__ hidden_states,
-        fp_t* __restrict__ q,
-        const fp_t* __restrict__ w_q,
-        const fp_t* __restrict__ b_q,
-        uint32_t batch_size,
-        uint32_t seq_length,
-        uint32_t n_embd);
+// template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
+// __global__ void q_projection_kernel(
+//         const fp_t* __restrict__ hidden_states,
+//         fp_t* __restrict__ q,
+//         const fp_t* __restrict__ w_q,
+//         const fp_t* __restrict__ b_q,
+//         uint32_t batch_size,
+//         uint32_t seq_length,
+//         uint32_t n_embd) {
+//     // Warp index within the block
+//     const uint32_t thread_id = threadIdx.y * blockDim.x + threadIdx.x;
+//     const uint32_t threads_per_block = blockDim.x * blockDim.y;
+//     const uint32_t warp_id = (threadIdx.y * blockDim.x + threadIdx.x) / WARP_SIZE;
+//     const uint32_t warp_m = warp_id / (BLOCK_M / WMMA_M);
+//     const uint32_t warp_n = warp_id % (BLOCK_M / WMMA_M);
 
-template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
+//     // Block-level tile starting positions, index into the output matrix
+//     const uint32_t block_tile_m = blockIdx.y * BLOCK_M;
+//     const uint32_t block_tile_n = blockIdx.x * BLOCK_N;
+
+//     // Warp-level tile starting positions, index into the output matrix
+//     const uint32_t warp_tile_m = block_tile_m + warp_m * WMMA_M;
+//     const uint32_t warp_tile_n = block_tile_n + warp_n * WMMA_N;
+
+//     // How many elements each thread will load into shared memory
+//     // from A (hidden_states) and B (w_q)
+//     const uint32_t A_elements_per_thread = (BLOCK_M * BLOCK_K + threads_per_block - 1) / threads_per_block;
+//     const uint32_t B_elements_per_thread = (BLOCK_K * BLOCK_N + threads_per_block - 1) / threads_per_block;
+//     const uint32_t C_elements_per_thread = (BLOCK_M * BLOCK_N + threads_per_block - 1) / threads_per_block;
+
+//     // Define shared memory for A and B tiles
+//     extern __shared__ half smem[];
+//     half* hidden_shared = &smem[0];
+//     half* w_q_shared = &smem[BLOCK_M * BLOCK_K];
+
+//     // Declare the fragments
+//     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+//     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
+//     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+//     // Initialize the accumulator fragment with zeros
+//     wmma::fill_fragment(c_frag, 0.0f);
+
+//     // Loop over k dimension
+//     for (uint32_t block_tile_k = 0; block_tile_k < n_embd; block_tile_k += BLOCK_K) {
+//         // Load A (hidden_states) from global to shared memory
+//         for (uint32_t i = 0; i < A_elements_per_thread; i++) {
+//             uint32_t element_id = thread_id + i * threads_per_block;
+//             if (element_id < BLOCK_M * BLOCK_K) {
+//                 uint32_t m_idx = element_id / BLOCK_K;
+//                 uint32_t k_idx = element_id % BLOCK_K;
+                
+//                 // Check bounds
+//                 if ((block_tile_m + m_idx) < batch_size &&
+//                     (block_tile_k + k_idx) < n_embd) {
+//                     // Calculate global index for A (MxDxK, row-major)
+//                     // A[m][d_idx][k] -> m * (D * K) + d_idx * K + k
+//                     uint64_t global_idx = (block_tile_m + m_idx) * seq_length * n_embd +
+//                                           (seq_length - 1) * n_embd +
+//                                           (block_tile_k + k_idx);
+//                     hidden_shared[m_idx * BLOCK_K + k_idx] = __float2half(hidden_states[global_idx]);
+//                 } else {
+//                     hidden_shared[m_idx * BLOCK_K + k_idx] = __float2half(0.0f);
+//                 }
+//             }
+//         }
+
+//         // Load B (w_q) from global to shared memory
+//         for (uint32_t i = 0; i < B_elements_per_thread; i++) {
+//             uint32_t element_id = thread_id + i * threads_per_block;
+//             if (element_id < BLOCK_K * BLOCK_N) {
+//                 uint32_t k_idx = element_id % BLOCK_K;
+//                 uint32_t n_idx = element_id / BLOCK_K;
+                
+//                 // Check bounds
+//                 if ((block_tile_k + k_idx) < n_embd && (block_tile_n + n_idx) < n_embd) {
+//                     // Calculate global index for B (KxN, column-major)
+//                     // B[k][n] -> k + K * n
+//                     uint32_t global_idx = (block_tile_k + k_idx) + n_embd * (block_tile_n + n_idx);
+//                     w_q_shared[k_idx + BLOCK_K * n_idx] = __float2half(w_q[global_idx]);
+//                 } else {
+//                     w_q_shared[k_idx + BLOCK_K * n_idx] = __float2half(0.0f);
+//                 }
+//             }
+//         }
+
+//         __syncthreads();
+
+//         // Loop over the shared tile with tensor core operations
+//         for (uint32_t k_warp = 0; k_warp < BLOCK_K; k_warp += WMMA_K) {
+//             // Load A and B from shared memory into fragments
+//             uint32_t a_row = warp_m * WMMA_M;
+//             uint32_t a_col = k_warp;
+//             uint32_t b_row = k_warp;
+//             uint32_t b_col = warp_n * WMMA_N;
+            
+//             // Load matrix fragments from shared memory
+//             wmma::load_matrix_sync(a_frag, &hidden_shared[a_row * BLOCK_K + a_col], BLOCK_K);
+//             wmma::load_matrix_sync(b_frag, &w_q_shared[b_row + BLOCK_K * b_col], BLOCK_K);
+            
+//             // Perform matrix multiplication
+//             wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+//         }
+
+//         // Ensure all warps have finished using shared memory
+//         __syncthreads();
+//     }
+
+//     // Store the output
+//     if (warp_tile_m < batch_size && warp_tile_n < n_embd) {
+//         wmma::store_matrix_sync(
+//             &q[warp_tile_m * n_embd + warp_tile_n],
+//             c_frag,
+//             n_embd,
+//             wmma::mem_row_major);
+        
+//         // Add bias
+//         for (uint32_t i = 0; i < C_elements_per_thread; i++) {
+//             uint32_t element_id = thread_id + i * threads_per_block;
+//             if (element_id < BLOCK_M * BLOCK_N) {
+//                 uint32_t m_idx = element_id / BLOCK_N;
+//                 uint32_t n_idx = element_id % BLOCK_N;
+
+//                 // Check bounds
+//                 if ((warp_tile_m + m_idx) < batch_size &&
+//                     (warp_tile_n + n_idx) < n_embd) {
+//                     // Store the output in q
+//                     q[(warp_tile_m + m_idx) * n_embd +
+//                       (warp_tile_n + n_idx)] += b_q[warp_tile_n + n_idx];
+//                 }
+//             }
+//         }
+//     }
+// }
+
+// // Explicit instantiation
+// template __global__ void q_projection_kernel<32, 32, 32>(
+//         const fp_t* __restrict__ hidden_states,
+//         fp_t* __restrict__ q,
+//         const fp_t* __restrict__ w_q,
+//         const fp_t* __restrict__ b_q,
+//         uint32_t batch_size,
+//         uint32_t seq_length,
+//         uint32_t n_embd);
+
 __global__ void kv_projection_kernel(
         const fp_t* __restrict__ hidden_states,
         half* __restrict__ kv,
@@ -380,148 +379,181 @@ __global__ void kv_projection_kernel(
         uint32_t seq_length,
         uint32_t seq_offset,
         uint32_t n_embd) {
-    // Warp index within the block
-    const uint32_t thread_id = threadIdx.y * blockDim.x + threadIdx.x;
-    const uint32_t threads_per_block = blockDim.x * blockDim.y;
-    const uint32_t warp_id = (threadIdx.y * blockDim.x + threadIdx.x) / WARP_SIZE;
-    const uint32_t warp_m = warp_id / (BLOCK_M / WMMA_M);
-    const uint32_t warp_n = warp_id % (BLOCK_M / WMMA_M);
-    const uint32_t batch_id = blockIdx.z * blockDim.z + threadIdx.z;
+    // Calculate batch and embedding indices
+    uint32_t idx_embd  = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
+    uint32_t idx_batch = blockIdx.z * blockDim.z + threadIdx.z;
 
-    // Block-level tile starting positions, index into the output matrix
-    const uint32_t block_tile_m = blockIdx.y * BLOCK_M;
-    const uint32_t block_tile_n = blockIdx.x * BLOCK_N;
-
-    // Warp-level tile starting positions, index into the output matrix
-    const uint32_t warp_tile_m = block_tile_m + warp_m * WMMA_M;
-    const uint32_t warp_tile_n = block_tile_n + warp_n * WMMA_N;
-
-    // How many elements each thread will load into shared memory
-    // from A (hidden_states) and B (w_kv)
-    // and write to C (kv)
-    const uint32_t A_elements_per_thread = (BLOCK_M * BLOCK_K + threads_per_block - 1) / threads_per_block;
-    const uint32_t B_elements_per_thread = (BLOCK_K * BLOCK_N + threads_per_block - 1) / threads_per_block;
-    const uint32_t C_elements_per_thread = (BLOCK_M * BLOCK_N + threads_per_block - 1) / threads_per_block;
-
-    // Define shared memory for A and B tiles
-    extern __shared__ half smem[];
-    half* hidden_shared = &smem[0];
-    half* w_kv_shared = &smem[BLOCK_M * BLOCK_K];
-
-    // Declare the fragments
-    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-
-    // Initialize the accumulator fragment with zeros
-    wmma::fill_fragment(c_frag, 0.0f);
-
-    __syncthreads();
-
-    // Loop over k dimension
-    for (uint32_t block_tile_k = 0; block_tile_k < n_embd; block_tile_k += BLOCK_K) {
-        // Load A (hidden_states) from global to shared memory
-        for (uint32_t i = 0; i < A_elements_per_thread; i++) {
-            uint32_t element_id = thread_id + i * threads_per_block;
-            if (element_id < BLOCK_M * BLOCK_K) {
-                uint32_t m_idx = element_id / BLOCK_K;
-                uint32_t k_idx = element_id % BLOCK_K;
-                
-                // Check bounds
-                if ((block_tile_m + m_idx + seq_offset) < seq_length &&
-                    (block_tile_k + k_idx) < n_embd) {
-                    // Calculate global index for A (DxMxK, row-major)
-                    // A[batch_id][m][k] -> batch_id * (M * K) + m * (K) + k
-                    uint64_t global_idx = batch_id * seq_length * n_embd +
-                                          (block_tile_m + m_idx + seq_offset) * n_embd +
-                                          (block_tile_k + k_idx);
-                    hidden_shared[m_idx * BLOCK_K + k_idx] = __float2half(hidden_states[global_idx]);
-                } else {
-                    hidden_shared[m_idx * BLOCK_K + k_idx] = __float2half(0.0f);
-                }
-            }
-        }
-
-        // Load B (w_kv) from global to shared memory
-        for (uint32_t i = 0; i < B_elements_per_thread; i++) {
-            uint32_t element_id = thread_id + i * threads_per_block;
-            if (element_id < BLOCK_K * BLOCK_N) {
-                uint32_t k_idx = element_id % BLOCK_K;
-                uint32_t n_idx = element_id / BLOCK_K;
-                
-                // Check bounds
-                if ((block_tile_k + k_idx) < n_embd && (block_tile_n + n_idx) < n_embd) {
-                    // Calculate global index for B (KxN, column-major)
-                    // B[k][n] -> k + N * n
-                    uint32_t global_idx = (block_tile_k + k_idx) + n_embd * (block_tile_n + n_idx);
-                    w_kv_shared[k_idx + BLOCK_N * n_idx] = __float2half(w_kv[global_idx]);
-                } else {
-                    w_kv_shared[k_idx + BLOCK_N * n_idx] = __float2half(0.0f);
-                }
-            }
-        }
-
-        __syncthreads();
-
-        // Loop over the shared tile with tensor core operations
-        for (uint32_t k_warp = 0; k_warp < BLOCK_K; k_warp += WMMA_K) {
-            // Load A and B from shared memory into fragments
-            uint32_t a_row = warp_m * WMMA_M;
-            uint32_t a_col = k_warp;
-            uint32_t b_row = k_warp;
-            uint32_t b_col = warp_n * WMMA_N;
-            
-            // Load matrix fragments from shared memory
-            wmma::load_matrix_sync(a_frag, &hidden_shared[a_row * BLOCK_K + a_col], BLOCK_K);
-            wmma::load_matrix_sync(b_frag, &w_kv_shared[b_row + BLOCK_N * b_col], BLOCK_N);
-            
-            // Perform matrix multiplication
-            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-        }
-
-        // Ensure all warps have finished using shared memory
-        __syncthreads();
+    // Check bounds
+    if (idx_embd  >= n_embd ||
+        idx_seq   >= seq_length ||
+        idx_batch >= batch_size) {
+        return;
     }
 
-    // Store the output
-    if ((warp_tile_m + seq_offset) < seq_length &&
-        warp_tile_n < n_embd) {
-        
-        // Store the output in shared memory
-        float* output = reinterpret_cast<float*>(smem);
-        wmma::store_matrix_sync(output, c_frag, WMMA_N, wmma::mem_row_major);
+    // Calculate memory offsets
+    uint64_t hidden_offset = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
+    uint64_t kv_offset = ((uint64_t)idx_batch * seq_length + (idx_seq + seq_offset)) * n_embd;
 
-        // Add bias and transfer the output to KV
-        for (uint32_t i = 0; i < C_elements_per_thread; i++) {
-            uint32_t element_id = thread_id + i * threads_per_block;
-            if (element_id < BLOCK_M * BLOCK_N) {
-                uint32_t m_idx = element_id / BLOCK_N;
-                uint32_t n_idx = element_id % BLOCK_N;
-
-                // Check bounds
-                if ((warp_tile_m + m_idx + seq_offset) < seq_length &&
-                    (warp_tile_n + n_idx) < n_embd) {
-                    // Store the output in kv
-                    kv[batch_id * seq_length * n_embd +
-                       (warp_tile_m + m_idx + seq_offset) * n_embd +
-                       (warp_tile_n + n_idx)] = __float2half(output[m_idx * BLOCK_N + n_idx]) +
-                                                __float2half(b_kv[warp_tile_n + n_idx]);
-                }
-            }
-        }
+    // Perform KV projection
+    float val = b_kv[idx_embd];
+    for (uint32_t i = 0; i < n_embd; i++) {
+        val += hidden_states[hidden_offset + i] * w_kv[i + n_embd * idx_embd];
     }
+    kv[kv_offset + idx_embd] = __float2half(val);
 }
 
-// Explicit instantiation
-template __global__ void kv_projection_kernel<32, 32, 32>(
-        const fp_t* __restrict__ hidden_states,
-        half* __restrict__ kv,
-        const fp_t* __restrict__ w_kv,
-        const fp_t* __restrict__ b_kv,
-        uint32_t batch_size,
-        uint32_t seq_length,
-        uint32_t seq_offset,
-        uint32_t n_embd);
+// template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
+// __global__ void kv_projection_kernel(
+//         const fp_t* __restrict__ hidden_states,
+//         half* __restrict__ kv,
+//         const fp_t* __restrict__ w_kv,
+//         const fp_t* __restrict__ b_kv,
+//         uint32_t batch_size,
+//         uint32_t seq_length,
+//         uint32_t seq_offset,
+//         uint32_t n_embd) {
+//     // Warp index within the block
+//     const uint32_t thread_id = threadIdx.y * blockDim.x + threadIdx.x;
+//     const uint32_t threads_per_block = blockDim.x * blockDim.y;
+//     const uint32_t warp_id = (threadIdx.y * blockDim.x + threadIdx.x) / WARP_SIZE;
+//     const uint32_t warp_m = warp_id / (BLOCK_M / WMMA_M);
+//     const uint32_t warp_n = warp_id % (BLOCK_M / WMMA_M);
+//     const uint32_t batch_id = blockIdx.z * blockDim.z + threadIdx.z;
+
+//     // Block-level tile starting positions, index into the output matrix
+//     const uint32_t block_tile_m = blockIdx.y * BLOCK_M;
+//     const uint32_t block_tile_n = blockIdx.x * BLOCK_N;
+
+//     // Warp-level tile starting positions, index into the output matrix
+//     const uint32_t warp_tile_m = block_tile_m + warp_m * WMMA_M;
+//     const uint32_t warp_tile_n = block_tile_n + warp_n * WMMA_N;
+
+//     // How many elements each thread will load into shared memory
+//     // from A (hidden_states) and B (w_kv)
+//     // and write to C (kv)
+//     const uint32_t A_elements_per_thread = (BLOCK_M * BLOCK_K + threads_per_block - 1) / threads_per_block;
+//     const uint32_t B_elements_per_thread = (BLOCK_K * BLOCK_N + threads_per_block - 1) / threads_per_block;
+//     const uint32_t C_elements_per_thread = (BLOCK_M * BLOCK_N + threads_per_block - 1) / threads_per_block;
+
+//     // Define shared memory for A and B tiles
+//     extern __shared__ half smem[];
+//     half* hidden_shared = &smem[0];
+//     half* w_kv_shared = &smem[BLOCK_M * BLOCK_K];
+
+//     // Declare the fragments
+//     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+//     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
+//     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+//     // Initialize the accumulator fragment with zeros
+//     wmma::fill_fragment(c_frag, 0.0f);
+
+//     __syncthreads();
+
+//     // Loop over k dimension
+//     for (uint32_t block_tile_k = 0; block_tile_k < n_embd; block_tile_k += BLOCK_K) {
+//         // Load A (hidden_states) from global to shared memory
+//         for (uint32_t i = 0; i < A_elements_per_thread; i++) {
+//             uint32_t element_id = thread_id + i * threads_per_block;
+//             if (element_id < BLOCK_M * BLOCK_K) {
+//                 uint32_t m_idx = element_id / BLOCK_K;
+//                 uint32_t k_idx = element_id % BLOCK_K;
+                
+//                 // Check bounds
+//                 if ((block_tile_m + m_idx + seq_offset) < seq_length &&
+//                     (block_tile_k + k_idx) < n_embd) {
+//                     // Calculate global index for A (DxMxK, row-major)
+//                     // A[batch_id][m][k] -> batch_id * (M * K) + m * (K) + k
+//                     uint64_t global_idx = batch_id * seq_length * n_embd +
+//                                           (block_tile_m + m_idx + seq_offset) * n_embd +
+//                                           (block_tile_k + k_idx);
+//                     hidden_shared[m_idx * BLOCK_K + k_idx] = __float2half(hidden_states[global_idx]);
+//                 } else {
+//                     hidden_shared[m_idx * BLOCK_K + k_idx] = __float2half(0.0f);
+//                 }
+//             }
+//         }
+
+//         // Load B (w_kv) from global to shared memory
+//         for (uint32_t i = 0; i < B_elements_per_thread; i++) {
+//             uint32_t element_id = thread_id + i * threads_per_block;
+//             if (element_id < BLOCK_K * BLOCK_N) {
+//                 uint32_t k_idx = element_id % BLOCK_K;
+//                 uint32_t n_idx = element_id / BLOCK_K;
+                
+//                 // Check bounds
+//                 if ((block_tile_k + k_idx) < n_embd && (block_tile_n + n_idx) < n_embd) {
+//                     // Calculate global index for B (KxN, column-major)
+//                     // B[k][n] -> k + N * n
+//                     uint32_t global_idx = (block_tile_k + k_idx) + n_embd * (block_tile_n + n_idx);
+//                     w_kv_shared[k_idx + BLOCK_N * n_idx] = __float2half(w_kv[global_idx]);
+//                 } else {
+//                     w_kv_shared[k_idx + BLOCK_N * n_idx] = __float2half(0.0f);
+//                 }
+//             }
+//         }
+
+//         __syncthreads();
+
+//         // Loop over the shared tile with tensor core operations
+//         for (uint32_t k_warp = 0; k_warp < BLOCK_K; k_warp += WMMA_K) {
+//             // Load A and B from shared memory into fragments
+//             uint32_t a_row = warp_m * WMMA_M;
+//             uint32_t a_col = k_warp;
+//             uint32_t b_row = k_warp;
+//             uint32_t b_col = warp_n * WMMA_N;
+            
+//             // Load matrix fragments from shared memory
+//             wmma::load_matrix_sync(a_frag, &hidden_shared[a_row * BLOCK_K + a_col], BLOCK_K);
+//             wmma::load_matrix_sync(b_frag, &w_kv_shared[b_row + BLOCK_N * b_col], BLOCK_N);
+            
+//             // Perform matrix multiplication
+//             wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+//         }
+
+//         // Ensure all warps have finished using shared memory
+//         __syncthreads();
+//     }
+
+//     // Store the output
+//     if ((warp_tile_m + seq_offset) < seq_length &&
+//         warp_tile_n < n_embd) {
+//         // Store the output in shared memory
+//         float* output = reinterpret_cast<float*>(smem);
+//         wmma::store_matrix_sync(output, c_frag, WMMA_N, wmma::mem_row_major);
+
+//         // Add bias and transfer the output to KV
+//         for (uint32_t i = 0; i < C_elements_per_thread; i++) {
+//             uint32_t element_id = thread_id + i * threads_per_block;
+//             if (element_id < BLOCK_M * BLOCK_N) {
+//                 uint32_t m_idx = element_id / BLOCK_N;
+//                 uint32_t n_idx = element_id % BLOCK_N;
+
+//                 // Check bounds
+//                 if ((warp_tile_m + m_idx + seq_offset) < seq_length &&
+//                     (warp_tile_n + n_idx) < n_embd) {
+//                     // Store the output in kv
+//                     kv[batch_id * seq_length * n_embd +
+//                        (warp_tile_m + m_idx + seq_offset) * n_embd +
+//                        (warp_tile_n + n_idx)] = __float2half(output[m_idx * BLOCK_N + n_idx]) +
+//                                                 __float2half(b_kv[warp_tile_n + n_idx]);
+//                 }
+//             }
+//         }
+//     }
+// }
+
+// // Explicit instantiation
+// template __global__ void kv_projection_kernel<32, 32, 32>(
+//         const fp_t* __restrict__ hidden_states,
+//         half* __restrict__ kv,
+//         const fp_t* __restrict__ w_kv,
+//         const fp_t* __restrict__ b_kv,
+//         uint32_t batch_size,
+//         uint32_t seq_length,
+//         uint32_t seq_offset,
+//         uint32_t n_embd);
 
 __global__ void multi_head_attention_kernel(
         const fp_t* __restrict__ q,

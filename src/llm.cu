@@ -400,7 +400,9 @@ void LLM::run_inference(const std::vector<id_t>& token_ids,
                         uint32_t seq_length) {
     std::vector<id_t> token_ids_adjusted = token_ids;
     if (corpus_size > batch_size) {
-        std::cout << "WARNING: corpus_size > batch_size, only running on the first batch." << std::endl;
+        std::cout << "WARNING: corpus_size (" << corpus_size
+                  << ") > batch_size (" << batch_size
+                  << "), only running on the first batch." << std::endl;
         token_ids_adjusted.resize(batch_size * seq_length);
     } else {
         batch_size = corpus_size;
