@@ -28,37 +28,35 @@ __global__ void embedding_kernel(
     const uint32_t tidx = threadIdx.x;
 
     // Check bounds
-    if (idx_batch >= batch_size ||
-        idx_seq   >= seq_length) {
-        return;
-    }
-    
-    // Shared memory for token ID (one per block)
-    __shared__ id_t token_id;
-    if (tidx == 0) {
-        token_id = token_ids[idx_batch * seq_length + idx_seq];
-    }
-    __syncthreads();
-    
-    // Calculate base offsets
-    const uint64_t out_offset = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
-    const uint64_t wte_offset = (uint64_t)token_id * n_embd;
-    const uint64_t wpe_offset = ((uint64_t)idx_seq + seq_offset) * n_embd;
-    
-    // Iterate over the embedding dimension in chunks of 4
-    #pragma unroll
-    for (uint32_t i = tidx * 4; i < n_embd; i += BLOCK_SIZE * 4) {
-        // Load 4 elements from wte and wpe
-        const float4 wte_vec = *reinterpret_cast<const float4*>(&wte[wte_offset + i]);
-        const float4 wpe_vec = *reinterpret_cast<const float4*>(&wpe[wpe_offset + i]);
+    if (idx_batch < batch_size &&
+        idx_seq   < seq_length) {
+        // Shared memory for token ID (one per block)
+        __shared__ id_t token_id;
+        if (tidx == 0) {
+            token_id = token_ids[idx_batch * seq_length + idx_seq];
+        }
+        __syncthreads();
         
-        // Sum the two vectors
-        *reinterpret_cast<float4*>(&embeddings[out_offset + i]) = make_float4(
-            wte_vec.x + wpe_vec.x,
-            wte_vec.y + wpe_vec.y,
-            wte_vec.z + wpe_vec.z,
-            wte_vec.w + wpe_vec.w
-        );
+        // Calculate base offsets
+        const uint64_t out_offset = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
+        const uint64_t wte_offset = (uint64_t)token_id * n_embd;
+        const uint64_t wpe_offset = ((uint64_t)idx_seq + seq_offset) * n_embd;
+        
+        // Iterate over the embedding dimension in chunks of 4
+        #pragma unroll
+        for (uint32_t i = tidx * 4; i < n_embd; i += BLOCK_SIZE * 4) {
+            // Load 4 elements from wte and wpe
+            const float4 wte_vec = *reinterpret_cast<const float4*>(&wte[wte_offset + i]);
+            const float4 wpe_vec = *reinterpret_cast<const float4*>(&wpe[wpe_offset + i]);
+            
+            // Sum the two vectors
+            *reinterpret_cast<float4*>(&embeddings[out_offset + i]) = make_float4(
+                wte_vec.x + wpe_vec.x,
+                wte_vec.y + wpe_vec.y,
+                wte_vec.z + wpe_vec.z,
+                wte_vec.w + wpe_vec.w
+            );
+        }
     }
 }
 
@@ -89,88 +87,86 @@ __global__ void layer_normalization_kernel(
     const uint32_t warp_id = tidx / WARP_SIZE;
 
     // Check bounds
-    if (idx_batch >= batch_size ||
-        idx_seq   >= seq_length) {
-        return;
-    }
-
-    // Get the starting index for the current token
-    const uint64_t offset_input = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
-    
-    // Shared memory for partial sums - organized by warp for efficient access
-    __shared__ fp_t s_mean[WARPS_PER_BLOCK];
-    __shared__ fp_t s_variance[WARPS_PER_BLOCK];
-    
-    // Local accumulators
-    fp_t sum = 0.0f;
-    fp_t sq_sum = 0.0f;
-    
-    // Calculate local sum and squared sum (with coalesced memory access)
-    #pragma unroll
-    for (uint32_t i = tidx * 4; i < n_embd; i += BLOCK_SIZE * 4) {
-        float4 val4 = *reinterpret_cast<float4*>(&input[offset_input + i]);
-        sum += val4.x + val4.y + val4.z + val4.w;
-        sq_sum += val4.x * val4.x +
-                  val4.y * val4.y +
-                  val4.z * val4.z +
-                  val4.w * val4.w;
-    }
-    
-    // Warp-level reduction using shuffle operations
-    #pragma unroll
-    for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        sum    += __shfl_down_sync(0xffffffff, sum,    offset);
-        sq_sum += __shfl_down_sync(0xffffffff, sq_sum, offset);
-    }
-    
-    // First thread in each warp writes partial results
-    if (lane_id == 0) {
-        s_mean[warp_id] = sum;
-        s_variance[warp_id] = sq_sum;
-    }
-    __syncthreads();
-    
-    // Final reduction across warps (done by first warp)
-    if (warp_id == 0) {
-        // Load 0 for lanes that would access out of bounds
-        fp_t warp_sum = (lane_id < WARPS_PER_BLOCK) ? s_mean[lane_id] : 0.0f;
-        fp_t warp_sq_sum = (lane_id < WARPS_PER_BLOCK) ? s_variance[lane_id] : 0.0f;
+    if (idx_batch < batch_size &&
+        idx_seq   < seq_length) {
+        // Get the starting index for the current token
+        const uint64_t offset_input = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
         
-        // Warp-level reduction again
+        // Shared memory for partial sums - organized by warp for efficient access
+        __shared__ fp_t s_mean[WARPS_PER_BLOCK];
+        __shared__ fp_t s_variance[WARPS_PER_BLOCK];
+        
+        // Local accumulators
+        fp_t sum = 0.0f;
+        fp_t sq_sum = 0.0f;
+        
+        // Calculate local sum and squared sum (with coalesced memory access)
+        #pragma unroll
+        for (uint32_t i = tidx * 4; i < n_embd; i += BLOCK_SIZE * 4) {
+            float4 val4 = *reinterpret_cast<float4*>(&input[offset_input + i]);
+            sum += val4.x + val4.y + val4.z + val4.w;
+            sq_sum += val4.x * val4.x +
+                    val4.y * val4.y +
+                    val4.z * val4.z +
+                    val4.w * val4.w;
+        }
+        
+        // Warp-level reduction using shuffle operations
         #pragma unroll
         for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
-            warp_sq_sum += __shfl_down_sync(0xffffffff, warp_sq_sum, offset);
+            sum    += __shfl_down_sync(0xffffffff, sum,    offset);
+            sq_sum += __shfl_down_sync(0xffffffff, sq_sum, offset);
         }
         
-        // First thread calculates final values
+        // First thread in each warp writes partial results
         if (lane_id == 0) {
-            const fp_t inv_n = 1.0f / n_embd;
-            s_mean[0] = warp_sum * inv_n;
-            fp_t variance = fmaxf(warp_sq_sum * inv_n - s_mean[0] * s_mean[0], 0.0f);
-            s_variance[0] = rsqrtf(variance + 1e-5f);  // inverse standard deviation
+            s_mean[warp_id] = sum;
+            s_variance[warp_id] = sq_sum;
         }
-    }
-    __syncthreads();
-    
-    // Load final mean and inv_std
-    const fp_t mean = s_mean[0];
-    const fp_t inv_std = s_variance[0];
-    
-    // Normalize and scale - ensure coalesced memory access
-    // Each thread handles multiple sequential elements for better instruction throughput
-    #pragma unroll
-    for (uint32_t i = tidx * 4; i < n_embd; i += BLOCK_SIZE * 4) {
-        float4 input_vec = *reinterpret_cast<float4*>(&input[offset_input + i]);
-        float4 gamma_vec = *reinterpret_cast<const float4*>(&gamma[i]);
-        float4 beta_vec = *reinterpret_cast<const float4*>(&beta[i]);
+        __syncthreads();
+        
+        // Final reduction across warps (done by first warp)
+        if (warp_id == 0) {
+            // Load 0 for lanes that would access out of bounds
+            fp_t warp_sum = (lane_id < WARPS_PER_BLOCK) ? s_mean[lane_id] : 0.0f;
+            fp_t warp_sq_sum = (lane_id < WARPS_PER_BLOCK) ? s_variance[lane_id] : 0.0f;
+            
+            // Warp-level reduction again
+            #pragma unroll
+            for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+                warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+                warp_sq_sum += __shfl_down_sync(0xffffffff, warp_sq_sum, offset);
+            }
+            
+            // First thread calculates final values
+            if (lane_id == 0) {
+                const fp_t inv_n = 1.0f / n_embd;
+                s_mean[0] = warp_sum * inv_n;
+                fp_t variance = fmaxf(warp_sq_sum * inv_n - s_mean[0] * s_mean[0], 0.0f);
+                s_variance[0] = rsqrtf(variance + 1e-5f);  // inverse standard deviation
+            }
+        }
+        __syncthreads();
+        
+        // Load final mean and inv_std
+        const fp_t mean = s_mean[0];
+        const fp_t inv_std = s_variance[0];
+        
+        // Normalize and scale - ensure coalesced memory access
+        // Each thread handles multiple sequential elements for better instruction throughput
+        #pragma unroll
+        for (uint32_t i = tidx * 4; i < n_embd; i += BLOCK_SIZE * 4) {
+            float4 input_vec = *reinterpret_cast<float4*>(&input[offset_input + i]);
+            float4 gamma_vec = *reinterpret_cast<const float4*>(&gamma[i]);
+            float4 beta_vec = *reinterpret_cast<const float4*>(&beta[i]);
 
-        input_vec.x = (input_vec.x - mean) * inv_std * gamma_vec.x + beta_vec.x;
-        input_vec.y = (input_vec.y - mean) * inv_std * gamma_vec.y + beta_vec.y;
-        input_vec.z = (input_vec.z - mean) * inv_std * gamma_vec.z + beta_vec.z;
-        input_vec.w = (input_vec.w - mean) * inv_std * gamma_vec.w + beta_vec.w;
+            input_vec.x = (input_vec.x - mean) * inv_std * gamma_vec.x + beta_vec.x;
+            input_vec.y = (input_vec.y - mean) * inv_std * gamma_vec.y + beta_vec.y;
+            input_vec.z = (input_vec.z - mean) * inv_std * gamma_vec.z + beta_vec.z;
+            input_vec.w = (input_vec.w - mean) * inv_std * gamma_vec.w + beta_vec.w;
 
-        *reinterpret_cast<float4*>(&input[offset_input + i]) = input_vec;
+            *reinterpret_cast<float4*>(&input[offset_input + i]) = input_vec;
+        }
     }
 }
 
@@ -798,28 +794,26 @@ __global__ void add_residual_kernel(
     const uint32_t tidx = threadIdx.x;
 
     // Check bounds
-    if (idx_batch >= batch_size ||
-        idx_seq   >= seq_length) {
-        return;
-    }
+    if (idx_batch < batch_size &&
+        idx_seq   < seq_length) {
+        // Get the starting index for the current token
+        const uint64_t offset = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
 
-    // Get the starting index for the current token
-    const uint64_t offset = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
+        // Iterate over the embedding dimension in chunks of 4
+        #pragma unroll
+        for (uint32_t i = tidx * 4; i < n_embd; i += BLOCK_SIZE * 4) {
+            // Load 4 elements from input and residual
+            float4 input_vec = *reinterpret_cast<const float4*>(&input[offset + i]);
+            float4 residual_vec = *reinterpret_cast<const float4*>(&residual[offset + i]);
 
-    // Iterate over the embedding dimension in chunks of 4
-    #pragma unroll
-    for (uint32_t i = tidx * 4; i < n_embd; i += BLOCK_SIZE * 4) {
-        // Load 4 elements from input and residual
-        float4 input_vec = *reinterpret_cast<const float4*>(&input[offset + i]);
-        float4 residual_vec = *reinterpret_cast<const float4*>(&residual[offset + i]);
-
-        // Add residual
-        *reinterpret_cast<float4*>(&output[offset + i]) = make_float4(
-            input_vec.x + residual_vec.x,
-            input_vec.y + residual_vec.y,
-            input_vec.z + residual_vec.z,
-            input_vec.w + residual_vec.w
-        );
+            // Add residual
+            *reinterpret_cast<float4*>(&output[offset + i]) = make_float4(
+                input_vec.x + residual_vec.x,
+                input_vec.y + residual_vec.y,
+                input_vec.z + residual_vec.z,
+                input_vec.w + residual_vec.w
+            );
+        }
     }
 }
 
@@ -847,34 +841,32 @@ __global__ void mlp_kernel(
     uint32_t idx_seq   = blockIdx.y * blockDim.y + threadIdx.y;
 
     // Check bounds
-    if (idx_batch >= batch_size ||
-        idx_seq   >= seq_length) {
-        return;
-    }
+    if (idx_batch < batch_size &&
+        idx_seq   < seq_length) {
+        // Intermediate register
+        uint32_t intermediate_size = 4 * n_embd;
+        fp_t intermediate[INTERMEDIATE_SIZE];
 
-    // Intermediate register
-    uint32_t intermediate_size = 4 * n_embd;
-    fp_t intermediate[INTERMEDIATE_SIZE];
+        // Get the starting index for the current token
+        uint64_t offset_input = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
 
-    // Get the starting index for the current token
-    uint64_t offset_input = ((uint64_t)idx_batch * seq_length + idx_seq) * n_embd;
-
-    // Compute feedforward layer
-    for (uint32_t i = 0; i < intermediate_size; i++) {
-        fp_t val = b_fc[i];
-        for (uint32_t j = 0; j < n_embd; j++) {
-            val += input[offset_input + j] * w_fc[j * intermediate_size + i];
+        // Compute feedforward layer
+        for (uint32_t i = 0; i < intermediate_size; i++) {
+            fp_t val = b_fc[i];
+            for (uint32_t j = 0; j < n_embd; j++) {
+                val += input[offset_input + j] * w_fc[j * intermediate_size + i];
+            }
+            intermediate[i] = gelu(val);
         }
-        intermediate[i] = gelu(val);
-    }
 
-    // Compute projection back to hidden size
-    for (uint32_t i = 0; i < n_embd; i++) {
-        fp_t val = b_proj[i];
-        for (uint32_t j = 0; j < intermediate_size; j++) {
-            val += intermediate[j] * w_proj[j * n_embd + i];
+        // Compute projection back to hidden size
+        for (uint32_t i = 0; i < n_embd; i++) {
+            fp_t val = b_proj[i];
+            for (uint32_t j = 0; j < intermediate_size; j++) {
+                val += intermediate[j] * w_proj[j * n_embd + i];
+            }
+            output[offset_input + i] = val;
         }
-        output[offset_input + i] = val;
     }
 }
 
@@ -897,61 +889,59 @@ __global__ void lm_head_kernel(
     
 
     // Check bounds
-    if (idx_batch >= batch_size ||
-        idx_vocab >= n_vocab) {
-        return;
-    }
+    if (idx_batch < batch_size &&
+        idx_vocab < n_vocab) {
+        // Calculate output index
+        uint64_t idx_out = ((uint64_t)idx_batch * n_vocab + idx_vocab);
 
-    // Calculate output index
-    uint64_t idx_out = ((uint64_t)idx_batch * n_vocab + idx_vocab);
+        // Get the starting index for the current token
+        uint64_t offset_input =  ((uint64_t)idx_batch * seq_length + (seq_length - 1)) * n_embd;
+        uint64_t offset_weights = (uint64_t)idx_vocab * n_embd;
 
-    // Get the starting index for the current token
-    uint64_t offset_input =  ((uint64_t)idx_batch * seq_length + (seq_length - 1)) * n_embd;
-    uint64_t offset_weights = (uint64_t)idx_vocab * n_embd;
+        // Shared memory for partial sums
+        __shared__ float s_sums[WARPS_PER_BLOCK];
 
-    // Shared memory for partial sums
-    __shared__ float s_sums[WARPS_PER_BLOCK];
+        // Local accumulator
+        fp_t sum = biases ? biases[idx_vocab] : 0.0f;
 
-    // Local accumulator
-    fp_t sum = biases ? biases[idx_vocab] : 0.0f;
+        // Calculate local sum (with coalesced memory access)
+        #pragma unroll
+        for (uint32_t i = tidx * 4; i < n_embd; i += BLOCK_SIZE * 4) {
+            float4 hidden_vec = *reinterpret_cast<const float4*>(&hidden_state[offset_input + i]);
+            float4 weight_vec = *reinterpret_cast<const float4*>(&weights[offset_weights + i]);
 
-    // Calculate local sum (with coalesced memory access)
-    #pragma unroll
-    for (uint32_t i = tidx * 4; i < n_embd; i += BLOCK_SIZE * 4) {
-        float4 hidden_vec = *reinterpret_cast<const float4*>(&hidden_state[offset_input + i]);
-        float4 weight_vec = *reinterpret_cast<const float4*>(&weights[offset_weights + i]);
-
-        sum += hidden_vec.x * weight_vec.x +
-               hidden_vec.y * weight_vec.y +
-               hidden_vec.z * weight_vec.z +
-               hidden_vec.w * weight_vec.w;
-    }
-
-    // Warp-level reduction
-    #pragma unroll
-    for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        sum += __shfl_down_sync(0xffffffff, sum, offset);
-    }
-
-    // First thread in the warp writes the result
-    if (lane_id == 0) {
-        s_sums[warp_id] = sum;
-    }
-    __syncthreads();
-
-    // Final reduction across warps (done by first warp)
-    if (warp_id == 0) {
-        // Load 0 for lanes that would access out of bounds
-        float warp_sum = (lane_id < WARPS_PER_BLOCK) ? s_sums[lane_id] : 0.0f;
-        
-        // Warp-level reduction again
-        for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+            sum += hidden_vec.x * weight_vec.x +
+                hidden_vec.y * weight_vec.y +
+                hidden_vec.z * weight_vec.z +
+                hidden_vec.w * weight_vec.w;
         }
-        
-        // First thread calculates final values
+
+        // Warp-level reduction
+        #pragma unroll
+        for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        }
+
+        // First thread in the warp writes the result
         if (lane_id == 0) {
-            logits[idx_out] = warp_sum;
+            s_sums[warp_id] = sum;
+        }
+        __syncthreads();
+
+        // Final reduction across warps (done by first warp)
+        if (warp_id == 0) {
+            // Load 0 for lanes that would access out of bounds
+            float warp_sum = (lane_id < WARPS_PER_BLOCK) ? s_sums[lane_id] : 0.0f;
+            
+            // Warp-level reduction again
+            for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+                warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+            }
+            
+            // First thread calculates final values
+            if (lane_id == 0) {
+                logits[idx_out] = warp_sum;
+            }
         }
     }
 }
