@@ -66,6 +66,7 @@ __global__ void multi_head_attention_kernel(
     uint32_t n_head,
     uint32_t n_embd);
 
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K>
 __global__ void final_projection_kernel(
     const fp_t* __restrict__ input,
     fp_t* __restrict__ output,

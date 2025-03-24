@@ -102,6 +102,9 @@ void Layer::launch_qkv_projection(
         uint32_t batch_size,
         uint32_t seq_length,
         uint32_t seq_offset) {
+    // Block tiled approach with tensor cores
+    // Each block handles a block of tiles in the output
+    // Each warp handles one tile in a block
     constexpr uint32_t BLOCK_M_Q = 32;
     constexpr uint32_t BLOCK_N_Q = 32;
     constexpr uint32_t BLOCK_K_Q = 32;
@@ -163,13 +166,19 @@ void Layer::launch_final_projection(
         fp_t* d_output,
         uint32_t batch_size,
         uint32_t seq_length) {
-    // Each thread handles one token (i_batch, i_sequence, :)
-    // in the hidden states (batch, sequence, embedding)
-    dim3 block_size(32, 32, 1);
-    dim3 grid_size((batch_size + block_size.x - 1) / block_size.x,
-                   (seq_length + block_size.y - 1) / block_size.y,
-                   1);
-    final_projection_kernel<<<grid_size, block_size>>>(
+    // Block tiled approach with tensor cores
+    // Each block handles a block of tiles in the output
+    // Each warp handles one tile in a block
+    constexpr uint32_t BLOCK_M = 32;
+    constexpr uint32_t BLOCK_N = 32;
+    constexpr uint32_t BLOCK_K = 32;
+    constexpr uint32_t WARPS_PER_BLOCK = (BLOCK_M/WMMA_M * BLOCK_N/WMMA_N);
+    dim3 grid_size(((n_embd     + BLOCK_N - 1) / BLOCK_N),
+                   ((seq_length + BLOCK_M - 1) / BLOCK_M),
+                   batch_size);
+    dim3 block_size(WARP_SIZE, WARPS_PER_BLOCK, 1);
+    uint32_t shared_mem_size = (BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N) * sizeof(half);
+    final_projection_kernel<BLOCK_M, BLOCK_N, BLOCK_K><<<grid_size, block_size, shared_mem_size>>>(
         d_input, d_output,
         d_attn_c_proj_w_0, d_attn_c_proj_b_0,
         batch_size, seq_length, n_embd);
@@ -282,18 +291,18 @@ void Layer::load_from_hdf5(hid_t file_id, const std::string& layer_path) {
     std::vector<fp_t> h_mlp_c_proj_b_0(n_embd);
 
     // Read datasets from HDF5 file
-    read_dataset(file_id, layer_path + "/attn/c_attn/w_0", h_attn_c_attn_w_0);
-    read_dataset(file_id, layer_path + "/attn/c_attn/b_0", h_attn_c_attn_b_0);
-    read_dataset(file_id, layer_path + "/attn/c_proj/w_0", h_attn_c_proj_w_0);
-    read_dataset(file_id, layer_path + "/attn/c_proj/b_0", h_attn_c_proj_b_0);
-    read_dataset(file_id, layer_path + "/ln_1/b_0",        h_ln_1_b_0);
-    read_dataset(file_id, layer_path + "/ln_1/g_0",        h_ln_1_g_0);
-    read_dataset(file_id, layer_path + "/ln_2/b_0",        h_ln_2_b_0);
-    read_dataset(file_id, layer_path + "/ln_2/g_0",        h_ln_2_g_0);
-    read_dataset(file_id, layer_path + "/mlp/c_fc/w_0",    h_mlp_c_fc_w_0);
-    read_dataset(file_id, layer_path + "/mlp/c_fc/b_0",    h_mlp_c_fc_b_0);
-    read_dataset(file_id, layer_path + "/mlp/c_proj/w_0",  h_mlp_c_proj_w_0);
-    read_dataset(file_id, layer_path + "/mlp/c_proj/b_0",  h_mlp_c_proj_b_0);
+    read_dataset(file_id, layer_path + "/attn/c_attn/w_0", h_attn_c_attn_w_0, true);
+    read_dataset(file_id, layer_path + "/attn/c_attn/b_0", h_attn_c_attn_b_0, true);
+    read_dataset(file_id, layer_path + "/attn/c_proj/w_0", h_attn_c_proj_w_0, false);
+    read_dataset(file_id, layer_path + "/attn/c_proj/b_0", h_attn_c_proj_b_0, true);
+    read_dataset(file_id, layer_path + "/ln_1/b_0",        h_ln_1_b_0,        true);
+    read_dataset(file_id, layer_path + "/ln_1/g_0",        h_ln_1_g_0,        true);
+    read_dataset(file_id, layer_path + "/ln_2/b_0",        h_ln_2_b_0,        true);
+    read_dataset(file_id, layer_path + "/ln_2/g_0",        h_ln_2_g_0,        true);
+    read_dataset(file_id, layer_path + "/mlp/c_fc/w_0",    h_mlp_c_fc_w_0,    false);
+    read_dataset(file_id, layer_path + "/mlp/c_fc/b_0",    h_mlp_c_fc_b_0,    true);
+    read_dataset(file_id, layer_path + "/mlp/c_proj/w_0",  h_mlp_c_proj_w_0,  false);
+    read_dataset(file_id, layer_path + "/mlp/c_proj/b_0",  h_mlp_c_proj_b_0,  true);
 
     // Separate attention weights and biases into Q, K, and V
     std::vector<fp_t> h_attn_c_attn_w_Q_0(n_embd * n_embd);

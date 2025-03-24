@@ -95,8 +95,8 @@ void LLM::load_model(std::string model_path) {
     CHECK_CUDA(cudaMalloc(&d_wte_0, n_vocab * n_embd * sizeof(fp_t)));
     CHECK_CUDA(cudaMalloc(&d_wpe_0, n_ctx * n_embd * sizeof(fp_t)));
     std::cout << "  > Loading weights..." << std::endl;
-    read_dataset(file_id, base_path + "/wte_0", h_wte_0);
-    read_dataset(file_id, base_path + "/wpe_0", h_wpe_0);
+    read_dataset(file_id, base_path + "/wte_0", h_wte_0, true);
+    read_dataset(file_id, base_path + "/wpe_0", h_wpe_0, true);
 
     // Load layers
     for (uint32_t i = 0; i < n_layer; i++) {
@@ -117,8 +117,8 @@ void LLM::load_model(std::string model_path) {
     CHECK_CUDA(cudaMalloc(&d_ln_f_b_0, n_embd * sizeof(fp_t)));
     CHECK_CUDA(cudaMalloc(&d_ln_f_g_0, n_embd * sizeof(fp_t)));
     std::cout << "  > Loading weights..." << std::endl;
-    read_dataset(file_id, base_path + "/ln_f/b_0", h_ln_f_b_0);
-    read_dataset(file_id, base_path + "/ln_f/g_0", h_ln_f_g_0);
+    read_dataset(file_id, base_path + "/ln_f/b_0", h_ln_f_b_0, true);
+    read_dataset(file_id, base_path + "/ln_f/g_0", h_ln_f_g_0, true);
 
     // Close the file
     H5Fclose(file_id);
